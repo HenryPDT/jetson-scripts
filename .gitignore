@@ -1,0 +1,19 @@
+# Secrets files - never commit credentials
+.secrets
+*.secrets
+
+# Environment files with sensitive data
+.env
+.env.local
+.env.*.local
+
+# Editor/IDE files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
