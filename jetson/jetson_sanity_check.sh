@@ -108,6 +108,8 @@ JTOP_INSTALLED=0
 # PENDING_POWER_MODE_ID and NAME are used for interactive changes
 PENDING_POWER_MODE_ID="-1"
 PENDING_POWER_MODE_NAME=""
+# Docker availability flag - set by check_docker_installed
+DOCKER_AVAILABLE=0
 
 # --- Ensure Python Helper is Available ---
 # If running via curl|bash, download the helper to a temp file
@@ -1114,10 +1116,10 @@ check_conducive_analytics() {
 check_docker_login() {
     print_info "Checking Docker Registry Authentication: ${DOCKER_REGISTRY}..."
     
-    # Check if docker is installed first
-    if ! command -v docker &> /dev/null; then
-        print_error "Docker is not installed. Cannot login."
-        return 1
+    # Skip if Docker is not available
+    if [ "$DOCKER_AVAILABLE" -eq 0 ]; then
+        print_info "Skipping Docker login - Docker is not installed."
+        return 0
     fi
 
     # Optimization: Check if already logged in by inspecting Docker's config
@@ -1150,6 +1152,12 @@ check_docker_login() {
 
 check_docker_compose() {
     print_info "Checking Docker Compose..."
+    
+    # Skip if Docker is not available
+    if [ "$DOCKER_AVAILABLE" -eq 0 ]; then
+        print_info "Skipping Docker Compose check - Docker is not installed."
+        return 0
+    fi
     
     # 1. Check if 'docker compose' (modern plugin) or 'docker-compose' (standalone) works
     # Use sudo to ensure we check the same environment used for docker operations
@@ -1214,6 +1222,12 @@ check_docker_compose() {
 check_nvidia_runtime() {
     print_info "Checking NVIDIA Container Runtime..."
     
+    # Skip if Docker is not available
+    if [ "$DOCKER_AVAILABLE" -eq 0 ]; then
+        print_info "Skipping NVIDIA runtime check - Docker is not installed."
+        return 0
+    fi
+    
     # Check if 'nvidia' is a registered runtime
     if sudo docker info 2>/dev/null | grep -i "Runtimes:" | grep -q "nvidia"; then
         print_success "NVIDIA Container Runtime is correctly configured."
@@ -1257,32 +1271,113 @@ check_nvidia_runtime() {
 }
 
 
+check_docker_installed() {
+    print_info "Checking Docker installation..."
+    
+    # Check if docker command exists and daemon is running
+    if command -v docker &> /dev/null; then
+        if sudo docker info &> /dev/null; then
+            print_success "Docker is installed and running."
+            DOCKER_AVAILABLE=1
+            return 0
+        else
+            print_warning "Docker command exists but daemon is not running."
+            print_info "Attempting to start Docker service..."
+            if sudo systemctl start docker && sudo systemctl enable docker; then
+                sleep 2
+                if sudo docker info &> /dev/null; then
+                    print_success "Docker service started successfully."
+                    DOCKER_AVAILABLE=1
+                    return 0
+                fi
+            fi
+            print_error "Failed to start Docker service."
+            return 1
+        fi
+    fi
+    
+    print_warning "Docker is not installed."
+    print_info "Attempting to install Docker..."
+    
+    # Install Docker using NVIDIA's method for Jetson
+    # First, ensure prerequisites
+    if ! install_required_tools apt-transport-https ca-certificates curl gnupg lsb-release; then
+        print_error "Failed to install Docker prerequisites."
+        return 1
+    fi
+    
+    # Add Docker's official GPG key
+    print_info "Adding Docker GPG key..."
+    sudo mkdir -p /etc/apt/keyrings
+    if ! curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null; then
+        print_error "Failed to add Docker GPG key."
+        return 1
+    fi
+    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+    
+    # Add Docker repository
+    print_info "Adding Docker repository..."
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+      $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    
+    # Install Docker
+    print_info "Installing Docker Engine..."
+    if ! sudo apt-get update; then
+        print_error "Failed to update package list."
+        return 1
+    fi
+    
+    if ! sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
+        print_error "Failed to install Docker."
+        print_action "Try manual installation: ${BYellow}https://docs.docker.com/engine/install/ubuntu/${Color_Off}"
+        return 1
+    fi
+    
+    # Start and enable Docker
+    print_info "Starting Docker service..."
+    if sudo systemctl start docker && sudo systemctl enable docker; then
+        sleep 2
+        if sudo docker info &> /dev/null; then
+            print_success "Docker installed and running successfully."
+            DOCKER_AVAILABLE=1
+            return 0
+        fi
+    fi
+    
+    print_error "Docker installed but failed to start."
+    return 1
+}
+
+
 check_docker_group() {
     print_info "Checking Docker group membership..."
     
+    # Skip if Docker is not available
+    if [ "$DOCKER_AVAILABLE" -eq 0 ]; then
+        print_info "Skipping Docker group check - Docker is not installed."
+        return 0
+    fi
+    
     # Check if docker group exists
     if ! getent group docker > /dev/null 2>&1; then
-        print_warning "Docker group does not exist. Docker may not be installed."
-        print_info "Skipping docker group configuration."
-        return 0
+        print_warning "Docker group does not exist. This is unusual if Docker is installed."
+        return 1
     fi
     
     # Check if current user is already in the docker group
     if groups | grep -q "\bdocker\b"; then
         print_success "User ${USER} is already in the docker group."
         
-        # Verify docker command works without sudo (if docker is installed)
-        if command -v docker &> /dev/null; then
-            if docker ps &> /dev/null; then
-                print_success "Docker commands work without sudo."
-                return 0
-            else
-                print_warning "Docker group membership detected, but docker commands still require sudo."
-                print_info "You may need to log out and back in for changes to take full effect."
-                return 1
-            fi
+        # Verify docker command works without sudo
+        if docker ps &> /dev/null; then
+            print_success "Docker commands work without sudo."
+            return 0
+        else
+            print_warning "Docker group membership detected, but docker commands still require sudo."
+            print_info "You may need to log out and back in for changes to take full effect."
+            return 1
         fi
-        return 0
     else
         print_warning "User ${USER} is not in the docker group."
         print_info "Adding user to docker group..."
@@ -1482,6 +1577,9 @@ record_result "NX Witness Service" $?
 echo "----------------------------------------"
 check_conducive_analytics
 record_result "Conducive Analytics Repo" $?
+echo "----------------------------------------"
+check_docker_installed
+record_result "Docker Installation" $?
 echo "----------------------------------------"
 check_docker_group
 record_result "Docker Group Permissions" $?
