@@ -115,7 +115,7 @@ if [[ "$CHOICE" == "3" ]]; then
 fi
 
 echo "Starting SDK Manager with temporary config..."
-sdkmanager --cli --action install --response-file "$TEMP_INI"
+sdkmanager --cli --action --show-all-versions install --response-file "$TEMP_INI"
 
 # Clean up
 rm -f "$TEMP_INI"
