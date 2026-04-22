@@ -5,7 +5,7 @@ import argparse
 import time
 from jtop import jtop, JtopException
 
-def get_jetson_info(enable_clocks=False, set_nvpmodel=None):
+def get_jetson_info(enable_clocks=False, set_nvpmodel=None, set_fan_profile=None):
     data = {}
     try:
         with jtop() as jetson:
@@ -33,6 +33,14 @@ def get_jetson_info(enable_clocks=False, set_nvpmodel=None):
                     except Exception as e:
                         data['nvpmodel_action_error'] = str(e)
 
+                if set_fan_profile is not None:
+                    try:
+                        jetson.fan.profile = set_fan_profile
+                        time.sleep(1) # Wait for change to reflect
+                        data['fan_profile_action'] = f"Set fan profile to {set_fan_profile}"
+                    except Exception as e:
+                        data['fan_profile_action_error'] = str(e)
+
             if jetson.ok():
                 # Board Info
                 board = jetson.board
@@ -41,7 +49,15 @@ def get_jetson_info(enable_clocks=False, set_nvpmodel=None):
                     'serial': board.get('hardware', {}).get('Serial Number', 'Unknown'),
                     'l4t': board.get('hardware', {}).get('L4T', 'Unknown'),
                     'jetpack': board.get('hardware', {}).get('Jetpack', 'Unknown'),
-                    'module': board.get('hardware', {}).get('Module', 'Unknown')
+                    'module': board.get('hardware', {}).get('Module', 'Unknown'),
+                    'hardware': board.get('hardware', {}) # Preserve full hardware dict
+                }
+
+                # Network Info from jtop
+                interfaces_info = jetson.local_interfaces
+                data['net'] = {
+                    'hostname': interfaces_info.get('hostname', 'Unknown'),
+                    'interfaces': interfaces_info.get('interfaces', {})
                 }
 
                 # SDK Libraries
@@ -111,11 +127,22 @@ def get_jetson_info(enable_clocks=False, set_nvpmodel=None):
                 data['temperature'] = {k: round(v['temp'], 1) for k, v in temp_info.items() if v.get('online', False)}
 
                 # Fan Info
-                fan_info = jetson.fan
-                fan_speed = fan_info.get('speed', [0])[0] if isinstance(fan_info.get('speed'), list) else fan_info.get('speed', 0)
-                fan_profile = fan_info.get('profile', 'Unknown')
-                if fan_profile == "Unknown":
-                    fan_profile = fan_info.get('governor', fan_info.get('control', 'Unknown'))
+                fan = jetson.fan
+                fan_speed = 0
+                fan_profile = "Unknown"
+
+                try:
+                    # Get speed (handle list or scalar)
+                    speed = fan.speed
+                    fan_speed = speed[0] if isinstance(speed, list) and len(speed) > 0 else (speed if not isinstance(speed, list) else 0)
+                    
+                    # Get profile/governor/control
+                    fan_profile = fan.profile
+                    if not fan_profile or fan_profile == "Unknown":
+                        # Fallback for JetPack 5+
+                        fan_profile = getattr(fan, 'governor', getattr(fan, 'control', 'Unknown'))
+                except Exception as e:
+                    pass
 
                 data['fan'] = {
                     'speed': fan_speed,
@@ -154,7 +181,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--enable-clocks", action="store_true", help="Enable jetson_clocks and set to boot")
     parser.add_argument("--set-nvpmodel", type=str, help="Set NVP Model by name or ID")
+    parser.add_argument("--set-fan-profile", type=str, help="Set Fan Profile (e.g., 'cool', 'quiet')")
     args = parser.parse_args()
 
-    result = get_jetson_info(enable_clocks=args.enable_clocks, set_nvpmodel=args.set_nvpmodel)
+    result = get_jetson_info(
+        enable_clocks=args.enable_clocks, 
+        set_nvpmodel=args.set_nvpmodel,
+        set_fan_profile=args.set_fan_profile
+    )
     print(json.dumps(result, indent=2))

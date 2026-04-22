@@ -79,6 +79,15 @@ if [[ $MISSING_SECRETS -eq 1 ]]; then
     exit 1
 fi
 
+# --- Hardware Detection ---
+IS_JETSON=0
+if [[ -f /proc/device-tree/model ]]; then
+    MODEL=$(tr -d '\0' < /proc/device-tree/model)
+    if [[ "$MODEL" =~ "NVIDIA" || "$MODEL" =~ "Jetson" ]]; then
+        IS_JETSON=1
+    fi
+fi
+
 # --- Configuration ---
 # Minimum acceptable free space on the detected ~1TB drive in Gigabytes (GB)
 MIN_SSD_FREE_GB=100 # Default: 100GB
@@ -366,6 +375,140 @@ check_jetson_info() {
 }
 
 
+# --- Service Management ---
+manage_jtop_service() {
+    local action="${1:-restart}"
+    local service_name=""
+
+    # Detect service name first
+    if sudo systemctl cat jetson_stats.service &>/dev/null; then
+        service_name="jetson_stats.service"
+    elif sudo systemctl cat jtop.service &>/dev/null; then
+        service_name="jtop.service"
+    fi
+    
+    # If not found, try daemon-reload and check again
+    if [ -z "$service_name" ]; then
+        sudo systemctl daemon-reload >/dev/null 2>&1
+        if sudo systemctl cat jetson_stats.service &>/dev/null; then
+            service_name="jetson_stats.service"
+        elif sudo systemctl cat jtop.service &>/dev/null; then
+            service_name="jtop.service"
+        fi
+    fi
+
+    if [ -n "$service_name" ]; then
+        # If action is 'start', check if already running
+        if [[ "$action" == "start" ]]; then
+            if systemctl is-active --quiet "$service_name"; then
+                print_success "$service_name is already active."
+                return 0
+            fi
+        fi
+
+        print_info "${action^}ing $service_name..."
+        sudo systemctl enable "$service_name" >/dev/null 2>&1
+        if ! sudo systemctl "$action" "$service_name"; then
+            # If restart fails, try start
+            if [[ "$action" == "restart" ]]; then
+                sudo systemctl start "$service_name"
+            else
+                print_error "Failed to $action $service_name"
+                return 1
+            fi
+        fi
+        
+        # Verify it's actually running
+        sleep 2
+        if systemctl is-active --quiet "$service_name"; then
+            print_success "$service_name is active."
+            return 0
+        else
+            # One last try to start it
+            sudo systemctl start "$service_name" >/dev/null 2>&1
+            sleep 1
+            if systemctl is-active --quiet "$service_name"; then
+                print_success "$service_name is active."
+                return 0
+            fi
+            print_error "$service_name is NOT active after $action."
+            return 1
+        fi
+    else
+        # DEBUG: Show what units are available to help diagnose
+        print_warning "Neither jetson_stats.service nor jtop.service found by systemctl cat."
+        return 1
+    fi
+}
+
+
+# Ensure jetson-stats is installed and up-to-date on the host
+# Version parity between host service and container client is required.
+ensure_jetson_stats_on_host() {
+    if [ "$IS_JETSON" -eq 1 ]; then
+        local FORK_URL="git+https://github.com/HenryPDT/jetson_stats.git"
+        local MIN_VERSION="7.1.5"
+        
+        print_info "Checking jetson-stats on host (Target Version: $MIN_VERSION)..."
+
+        if ! command -v jtop &> /dev/null; then
+            print_info "jtop not found. Installing from $FORK_URL..."
+            if ! command -v pip3 &> /dev/null; then
+                if ! install_required_tools python3-pip; then
+                    print_error "Failed to install pip3."
+                    return 1
+                fi
+            fi
+            # Try standard install first, fall back to --break-system-packages for newer Ubuntu
+            if sudo pip3 install "$FORK_URL" 2>/dev/null || sudo pip3 install --break-system-packages "$FORK_URL"; then
+                print_success "jetson-stats installed successfully."
+                # Explicitly install the service and set up the jtop group
+                print_info "Configuring jtop service and permissions..."
+                if ! sudo jtop --install-service; then
+                    print_warning "jtop --install-service returned an error, but proceeding..."
+                fi
+                # Source the new environment variables for the current script session
+                if [ -f /etc/profile.d/jtop_env.sh ]; then
+                    source /etc/profile.d/jtop_env.sh
+                fi
+                manage_jtop_service "restart"
+                JTOP_INSTALLED=1
+                # Ensure user is in the jtop group
+                if getent group jtop > /dev/null; then
+                    sudo usermod -aG jtop "$USER"
+                fi
+            else
+                print_error "Failed to install jetson-stats."
+                return 1
+            fi
+            return 0
+        fi
+
+        # Check installed version
+        local current_ver=$(jtop -v | head -n 1 | awk '{print $NF}')
+        print_info "Detected jtop version: $current_ver"
+
+        # Simple version comparison (assumes semver-ish format)
+        if [ "$(printf '%s\n%s' "$MIN_VERSION" "$current_ver" | sort -V | head -n1)" != "$MIN_VERSION" ]; then
+            print_info "Host jtop version ($current_ver) is older than recommended ($MIN_VERSION)."
+            print_info "Updating from $FORK_URL..."
+            if sudo pip3 install --upgrade "$FORK_URL" 2>/dev/null || sudo pip3 install --upgrade --break-system-packages "$FORK_URL"; then
+                print_success "jetson-stats updated successfully."
+                # Ensure service is re-installed and reloaded after update
+                sudo jtop --install-service
+                manage_jtop_service "restart"
+                JTOP_INSTALLED=1
+            else
+                print_error "Failed to update jetson-stats."
+                return 1
+            fi
+        else
+            print_success "Host jtop version is correct."
+        fi
+    fi
+    return 0
+}
+
 check_jtop() {
   print_info "Checking JTOP (jetson-stats) and dependencies..."
   
@@ -378,47 +521,31 @@ check_jtop() {
     fi
   fi
 
-  # 2. Ensure jetson-stats is installed
-  if ! command -v jtop &> /dev/null; then
-    print_warning "JTOP command not found."
-    if ! command -v pip3 &> /dev/null; then
-      if ! install_required_tools python3-pip; then
-        print_error "Failed to install pip3."
-        return 1
-      fi
-    fi
-
-    print_info "Installing jetson-stats..."
-    # Try standard install first, fall back to --break-system-packages for newer Ubuntu
-    if sudo pip3 install -U jetson-stats 2>/dev/null || sudo pip3 install -U --break-system-packages jetson-stats; then
-      print_success "jetson-stats installed successfully."
-      JTOP_INSTALLED=1
-      # Ensure user is in the jtop group
-      if getent group jtop > /dev/null; then
-          sudo usermod -aG jtop "$USER"
-      fi
-    else
-      print_error "Failed to install jetson-stats."
-      return 1
-    fi
-  fi
+  # 2. Ensure jetson-stats is installed and up-to-date
+  ensure_jetson_stats_on_host || return 1
 
   # 3. Ensure jtop service is running
-  if ! systemctl is-active --quiet jtop.service; then
-    print_info "jtop service not running. Attempting to start..."
-    sudo systemctl enable jtop.service
-    sudo systemctl start jtop.service
-    sleep 2
-  fi
-
-  if systemctl is-active --quiet jtop.service; then
-    print_success "jtop service is running."
-  else
-    print_error "jtop service failed to start. API calls may fail."
+  if ! manage_jtop_service "start"; then
+    print_error "jtop service failed to start properly. API calls may fail."
     return 1
   fi
 
-  # 4. Ensure Python helper is available (download if missing)
+  # 4. Ensure user is in jtop group and handle permission check
+  # Note: we check 'groups' (current session) instead of 'id -nG $USER' (system database)
+  if ! groups | grep -qw "jtop"; then
+      # The current session doesn't have the group. Check if it exists in the system.
+      if getent group jtop > /dev/null; then
+          # Add user to group if not already there (idempotent)
+          sudo usermod -aG jtop "$USER" >/dev/null 2>&1
+          print_info "jtop group detected in system but not in this session. Using group switching for now."
+          JTOP_GROUP_NEEDED=1
+      else
+          # If it doesn't even exist in system, we might need a manual install
+          print_warning "jtop group not found in system."
+      fi
+  fi
+
+  # 5. Ensure Python helper is available (download if missing)
   ensure_python_helper
 
   # 5. Fetch data using Python helper
@@ -442,6 +569,48 @@ check_jtop() {
     print_warning "Python helper script not available. Some stats will be missing."
     return 1
   fi
+}
+
+check_fan_profile() {
+    print_info "Checking Fan Profile..."
+    
+    if [ -z "$JTOP_DATA" ]; then
+        print_warning "No jtop data available. Cannot check fan profile."
+        return 1
+    fi
+
+    local current_profile=$(echo "$JTOP_DATA" | jq -r '.fan.profile // "Unknown"')
+    print_info "Current Fan Profile: ${current_profile}"
+
+    if [ "$current_profile" != "cool" ]; then
+        print_warning "Fan profile is NOT set to 'cool'."
+        print_info "Attempting to set fan profile to 'cool'..."
+        
+        local action_result
+        action_result=$(sg jtop -c "python3 \"$PYTHON_HELPER\" --set-fan-profile cool" 2>/dev/null)
+        local fan_exit=$?
+        
+        if [ $fan_exit -eq 0 ]; then
+            local action_msg=$(echo "$action_result" | jq -r '.fan_profile_action // "Unknown action"')
+            local action_err=$(echo "$action_result" | jq -r '.fan_profile_action_error // "None"')
+            
+            if [ "$action_err" == "None" ]; then
+                print_success "Action: $action_msg"
+                # Refresh JTOP_DATA
+                JTOP_DATA="$action_result"
+                return 0
+            else
+                print_error "Failed to set fan profile: $action_err"
+                return 1
+            fi
+        else
+            print_error "Failed to call Python helper for fan profile update."
+            return 1
+        fi
+    else
+        print_success "Fan profile is already set to 'cool'."
+        return 0
+    fi
 }
 
 check_power_mode() {
@@ -1551,6 +1720,9 @@ echo "----------------------------------------"
 check_power_mode
 record_result "Power Mode" $?
 echo "----------------------------------------"
+check_fan_profile
+record_result "Fan Profile" $?
+echo "----------------------------------------"
 check_sdk_libraries
 record_result "SDK Libraries" $?
 echo "----------------------------------------"
@@ -1611,13 +1783,11 @@ if [ "$PENDING_POWER_MODE_ID" != "-1" ]; then
     sudo nvpmodel -m "$PENDING_POWER_MODE_ID"
 fi
 
-# 2. General Restart Notification (Fallback)
-# We only show this if jtop was installed separately.
-if [ "$JTOP_INSTALLED" -eq 1 ]; then
+# 2. Post-Installation Session Refresh
+if [ "$JTOP_INSTALLED" -eq 1 ] || [ "${JTOP_GROUP_NEEDED:-0}" -eq 1 ]; then
     echo ""
-    print_action "RESTART RECOMMENDED: Actions were performed that require a system reboot."
-    echo "  - jetson-stats (jtop) was installed/updated."
-    print_action "Please run: ${BYellow}sudo reboot${Color_Off}"
+    print_success "jetson-stats (jtop) configuration is complete!"
+    print_info "To use jtop in THIS terminal window without sudo, run: ${BYellow}newgrp jtop${Color_Off}"
 fi
 
 # Exit with 0 if all checks passed, 1 otherwise
