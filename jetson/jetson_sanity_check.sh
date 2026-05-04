@@ -294,15 +294,91 @@ install_required_tools() {
 
 check_system_time() {
     print_info "Checking System Date & Time..."
-    local current_system_time=$(date)
-    if [ -n "$current_system_time" ]; then
-        print_success "Current System Time: ${current_system_time}"
-    else
-        print_error "Failed to get current system time using 'date'."
+    
+    # 1. Get status for display
+    local td_status=$(timedatectl status 2>/dev/null)
+    if [ -z "$td_status" ]; then
+        print_error "Failed to run 'timedatectl status'."
         return 1
     fi
-    return 0
+    
+    local ntp_active=$(echo "$td_status" | grep "NTP service:" | grep -c "active" || echo 0)
+    local synced=$(echo "$td_status" | grep "System clock synchronized:" | grep -c "yes" || echo 0)
+    
+    # --- PROACTIVE FIX: NTP SERVICE ---
+    if [ "$ntp_active" -eq 0 ]; then
+        print_warning "NTP service is NOT active. Attempting to enable..."
+        if sudo timedatectl set-ntp true 2>/dev/null; then
+            print_success "NTP service enabled successfully."
+            sleep 2
+            # Refresh status for the display block below
+            td_status=$(timedatectl status 2>/dev/null)
+            ntp_active=$(echo "$td_status" | grep "NTP service:" | grep -c "active" || echo 0)
+            synced=$(echo "$td_status" | grep "System clock synchronized:" | grep -c "yes" || echo 0)
+        else
+            print_error "Failed to enable NTP service automatically."
+        fi
+    fi
+
+    # Display the essential parts of the status
+    echo "$td_status" | grep -E "Local time:|Universal time:|RTC time:|Time zone:|System clock synchronized:|NTP service:" | while read -r line; do
+        print_info "  $(echo "$line" | sed 's/^[ \t]*//')"
+    done
+
+    local errors=0
+    
+    # 2. Status reporting
+    if [ "$ntp_active" -eq 1 ]; then
+        print_success "NTP service is active."
+    else
+        print_warning "NTP service is NOT active. Time may drift."
+        errors=$((errors + 1))
+    fi
+    
+    if [ "$synced" -eq 1 ]; then
+        print_success "System clock is synchronized."
+    else
+        print_error "System clock is NOT synchronized. Local time may be incorrect."
+        errors=$((errors + 1))
+    fi
+    
+    # 3. PROACTIVE FIX: RTC ALIGNMENT ---
+    # Only attempt to sync RTC if the system clock IS synchronized (so we don't write bad time to RTC)
+    if [ "$synced" -eq 1 ]; then
+        local sys_unix=$(date +%s)
+        local rtc_line=$(echo "$td_status" | grep "RTC time:")
+        local rtc_time=$(echo "$rtc_line" | awk '{print $3, $4, $5}')
+        
+        if [ -n "$rtc_time" ]; then
+            # Try to parse RTC time (which is usually in UTC)
+            local rtc_unix=$(date -u -d "$rtc_time" +%s 2>/dev/null)
+            if [ -n "$rtc_unix" ]; then
+                local diff=$((sys_unix - rtc_unix))
+                local abs_diff=${diff#-} 
+                if [ "$abs_diff" -gt 5 ]; then
+                    print_warning "System clock and RTC are out of sync by ${abs_diff} seconds."
+                    print_info "Automatically syncing system time to Hardware Clock (RTC)..."
+                    if sudo hwclock --systohc; then
+                        print_success "Hardware Clock (RTC) updated successfully."
+                    else
+                        print_error "Failed to update Hardware Clock (RTC)."
+                    fi
+                else
+                    print_success "System clock and RTC are aligned (diff: ${abs_diff}s)."
+                fi
+            fi
+        fi
+    fi
+
+    # Return 0 if both active and synced, else return 1 to trigger warning/fail in summary
+    if [ "$ntp_active" -eq 1 ] && [ "$synced" -eq 1 ]; then
+        return 0
+    else
+        return 1
+    fi
 }
+
+
 
 check_sdk_libraries() {
   print_info "Checking SDK Libraries..."
