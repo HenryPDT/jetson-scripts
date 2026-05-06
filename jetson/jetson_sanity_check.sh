@@ -33,7 +33,8 @@ show_usage() {
     echo "Requirements:"
     echo "  - Sudo access"
     echo "  - .secrets file in the same directory containing:"
-    echo "      CONDUCIVE_GIT_PAT, DOCKER_USER, DOCKER_PASS, REMOTEIT_REGISTRATION_CODE"
+    echo "      CONDUCIVE_GIT_PAT, DOCKER_USER, DOCKER_PASS, REMOTEIT_REGISTRATION_CODE,"
+    echo "      NX_ADMIN_PASS, NX_CLOUD_USER, NX_CLOUD_PASS"
     exit 0
 }
 
@@ -52,8 +53,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd 2>/dev/null || echo ".")"
 
 SECRETS_FILE="${SCRIPT_DIR}/.secrets"
 
-# Only source .secrets if it exists AND we're missing required env vars
-if [[ -z "${CONDUCIVE_GIT_PAT:-}" || -z "${DOCKER_USER:-}" || -z "${DOCKER_PASS:-}" || -z "${REMOTEIT_REGISTRATION_CODE:-}" ]]; then
+# Only source .secrets if it exists AND we're missing any required env vars
+if [[ -z "${CONDUCIVE_GIT_PAT:-}" || -z "${DOCKER_USER:-}" || -z "${DOCKER_PASS:-}" || -z "${REMOTEIT_REGISTRATION_CODE:-}" || \
+      -z "${NX_ADMIN_PASS:-}" || -z "${NX_CLOUD_USER:-}" || -z "${NX_CLOUD_PASS:-}" ]]; then
     if [[ -f "$SECRETS_FILE" ]]; then
         # shellcheck source=/dev/null
         source "$SECRETS_FILE"
@@ -62,7 +64,7 @@ fi
 
 # Validate required secrets (must be set via env vars OR .secrets file)
 MISSING_SECRETS=0
-for var in CONDUCIVE_GIT_PAT DOCKER_USER DOCKER_PASS REMOTEIT_REGISTRATION_CODE; do
+for var in CONDUCIVE_GIT_PAT DOCKER_USER DOCKER_PASS REMOTEIT_REGISTRATION_CODE NX_ADMIN_PASS NX_CLOUD_USER NX_CLOUD_PASS; do
     if [[ -z "${!var:-}" ]]; then
         echo "[ERROR] Missing required secret: $var"
         MISSING_SECRETS=1
@@ -109,9 +111,12 @@ DOCKER_REGISTRY="ctanalyticstest.azurecr.io"
 REMOTEIT_DEVICE_NAME=""  # Will prompt user if empty
 
 # JTOP Helper Configuration
-# When running via curl|bash, the helper will be downloaded automatically
 PYTHON_HELPER_URL="${PYTHON_HELPER_URL:-https://raw.githubusercontent.com/HenryPDT/jetson-scripts/main/jetson/jetson_jtop_helper.py}"
 PYTHON_HELPER="${SCRIPT_DIR}/jetson_jtop_helper.py"
+
+# NX Setup Configuration
+NX_SETUP_URL="${NX_SETUP_URL:-https://raw.githubusercontent.com/HenryPDT/jetson-scripts/main/jetson/nx_setup.py}"
+NX_SETUP_HELPER="${SCRIPT_DIR}/nx_setup.py"
 JTOP_DATA=""
 JTOP_INSTALLED=0
 # PENDING_POWER_MODE_ID and NAME are used for interactive changes
@@ -121,13 +126,14 @@ PENDING_POWER_MODE_NAME=""
 DOCKER_AVAILABLE=0
 
 # --- Ensure Python Helper is Available ---
-# If running via curl|bash, download the helper to a temp file
+# If running via curl|bash, the helper will be downloaded automatically to ensure latest version
 ensure_python_helper() {
-    if [[ -f "$PYTHON_HELPER" ]]; then
-        return 0  # Already exists locally
+    # If the file exists locally and we ARE in a local script directory (not a temp one), use it
+    if [[ -f "${SCRIPT_DIR}/jetson_jtop_helper.py" ]] && [[ ! "$PYTHON_HELPER" =~ /tmp/ ]]; then
+        return 0
     fi
     
-    # Download to temp file
+    # Otherwise, download the latest version to a temp file
     print_info "Downloading Python helper from GitHub..."
     local temp_helper
     temp_helper=$(mktemp --suffix=.py)
@@ -139,6 +145,29 @@ ensure_python_helper() {
         return 0
     else
         print_warning "Failed to download Python helper. Some jtop features will be unavailable."
+        return 1
+    fi
+}
+
+# --- Ensure NX Setup Helper is Available ---
+ensure_nx_setup_helper() {
+    # If the file exists locally and we ARE in a local script directory (not a temp one), use it
+    if [[ -f "${SCRIPT_DIR}/nx_setup.py" ]] && [[ ! "$NX_SETUP_HELPER" =~ /tmp/ ]]; then
+        return 0
+    fi
+    
+    # Otherwise, download the latest version to a temp file
+    print_info "Downloading NX setup helper from GitHub..."
+    local temp_nx
+    temp_nx=$(mktemp --suffix=.py)
+    TEMP_FILES+=("$temp_nx")
+    
+    if curl -sL "$NX_SETUP_URL" -o "$temp_nx" && [[ -s "$temp_nx" ]]; then
+        NX_SETUP_HELPER="$temp_nx"
+        print_success "NX setup helper downloaded successfully."
+        return 0
+    else
+        print_error "Failed to download NX setup helper. Automatic configuration will fail."
         return 1
     fi
 }
@@ -287,6 +316,58 @@ install_required_tools() {
     fi
     
     print_success "Successfully installed: ${missing_tools[*]}"
+    return 0
+}
+
+# --- Utility Function: Get System Identity ---
+get_system_identity() {
+    # Only run once
+    if [ -n "${SYSTEM_SERIAL:-}" ]; then
+        return 0
+    fi
+
+    local model_full="Unknown"
+    local serial_full="Unknown"
+    
+    if [ -f /proc/device-tree/model ]; then
+        model_full=$(tr -d '\0' < /proc/device-tree/model | tr -d '\n')
+    elif [ -f /sys/firmware/devicetree/base/model ]; then
+        model_full=$(tr -d '\0' < /sys/firmware/devicetree/base/model | tr -d '\n')
+    fi
+    
+    if [ -f /proc/device-tree/serial-number ]; then
+        serial_full=$(tr -d '\0' < /proc/device-tree/serial-number | tr -d '\n')
+    elif [ -f /sys/firmware/devicetree/base/serial-number ]; then
+        serial_full=$(tr -d '\0' < /sys/firmware/devicetree/base/serial-number | tr -d '\n')
+    fi
+    
+    # Extract a shorter model identifier (e.g., "Orin_Nano" or "Orin_NX")
+    SYSTEM_MODEL_SHORT="Jetson"
+    if echo "$model_full" | grep -qi "orin"; then
+        if echo "$model_full" | grep -qi "nano"; then
+            SYSTEM_MODEL_SHORT="Orin_Nano"
+        elif echo "$model_full" | grep -qi "nx"; then
+            SYSTEM_MODEL_SHORT="Orin_NX"
+        elif echo "$model_full" | grep -qi "agx"; then
+            SYSTEM_MODEL_SHORT="Orin_AGX"
+        else
+            SYSTEM_MODEL_SHORT="Orin"
+        fi
+    elif echo "$model_full" | grep -qi "xavier"; then
+        if echo "$model_full" | grep -qi "nx"; then
+            SYSTEM_MODEL_SHORT="Xavier_NX"
+        elif echo "$model_full" | grep -qi "agx"; then
+            SYSTEM_MODEL_SHORT="Xavier_AGX"
+        else
+            SYSTEM_MODEL_SHORT="Xavier"
+        fi
+    fi
+    
+    SYSTEM_SERIAL="${serial_full}"
+    if [ "$SYSTEM_SERIAL" = "Unknown" ] || [ -z "$SYSTEM_SERIAL" ]; then
+        SYSTEM_SERIAL="00000000"
+    fi
+    
     return 0
 }
 
@@ -1213,8 +1294,8 @@ check_nx_witness() {
             fi
         fi
 
-        print_info "Waiting a few seconds for service to stabilize..."
-        sleep 3 # Give the service a moment
+        print_info "Waiting 5 seconds for service to stabilize..."
+        sleep 5 # Give the service a moment
 
         # Now check if it's actually active
         if systemctl is-active --quiet "$NX_SERVICE_NAME"; then
@@ -1225,7 +1306,11 @@ check_nx_witness() {
                  active_line=$(echo "$active_line" | sed 's/^[ \t]*//')
                  print_info "${active_line}"
             fi
-            return 0 # Service is running
+            
+            # Integrated NX Setup
+            echo "----------------------------------------"
+            run_nx_setup
+            return $?
         else
             print_error "NX Witness service (${NX_SERVICE_NAME}) failed to become active."
             print_action "Please check service status manually: ${BYellow}sudo systemctl status ${NX_SERVICE_NAME}${Color_Off}"
@@ -1275,7 +1360,10 @@ check_nx_witness() {
                  # Try to start the service
                  if sudo systemctl start "$NX_SERVICE_NAME"; then
                      print_success "NX Witness service started."
-                     return 0
+                     # Integrated NX Setup
+                     echo "----------------------------------------"
+                     run_nx_setup
+                     return $?
                  else
                      print_warning "NX Witness installed but failed to start service."
                      print_action "Check service status manually: ${BYellow}sudo systemctl status ${NX_SERVICE_NAME}${Color_Off}"
@@ -1664,6 +1752,7 @@ register_with_remoteit() {
         local existing_device_name=$(sudo grep '"devicename"' "$remoteit_config" | cut -d'"' -f4)
         if [ -n "$existing_device_name" ]; then
             print_info "Device is registered as: ${existing_device_name}"
+            REMOTEIT_DEVICE_NAME_ACTUAL="${existing_device_name}"
         fi
         return 0
     fi
@@ -1680,52 +1769,8 @@ register_with_remoteit() {
     # Get device name from user if not set
     local device_name="${REMOTEIT_DEVICE_NAME}"
     if [ -z "$device_name" ]; then
-        # Get device model and serial ID for default name
-        local model_full="Unknown"
-        local serial_full="Unknown"
-        
-        if [ -f /proc/device-tree/model ]; then
-            model_full=$(tr -d '\0' < /proc/device-tree/model | tr -d '\n')
-        elif [ -f /sys/firmware/devicetree/base/model ]; then
-            model_full=$(tr -d '\0' < /sys/firmware/devicetree/base/model | tr -d '\n')
-        fi
-        
-        if [ -f /proc/device-tree/serial-number ]; then
-            serial_full=$(tr -d '\0' < /proc/device-tree/serial-number | tr -d '\n')
-        elif [ -f /sys/firmware/devicetree/base/serial-number ]; then
-            serial_full=$(tr -d '\0' < /sys/firmware/devicetree/base/serial-number | tr -d '\n')
-        fi
-        
-        # Extract a shorter model identifier (e.g., "Orin_Nano" or "Orin_NX")
-        local model_short="Jetson"
-        if echo "$model_full" | grep -qi "orin"; then
-            if echo "$model_full" | grep -qi "nano"; then
-                model_short="Orin_Nano"
-            elif echo "$model_full" | grep -qi "nx"; then
-                model_short="Orin_NX"
-            elif echo "$model_full" | grep -qi "agx"; then
-                model_short="Orin_AGX"
-            else
-                model_short="Orin"
-            fi
-        elif echo "$model_full" | grep -qi "xavier"; then
-            if echo "$model_full" | grep -qi "nx"; then
-                model_short="Xavier_NX"
-            elif echo "$model_full" | grep -qi "agx"; then
-                model_short="Xavier_AGX"
-            else
-                model_short="Xavier"
-            fi
-        fi
-        
-        # Use full serial number
-        local serial="${serial_full}"
-        if [ "$serial" = "Unknown" ] || [ -z "$serial" ]; then
-            serial="00000000"
-        fi
-        
-        # Create default device name: short_model-full_serial
-        local default_device_name="${model_short}-${serial}"
+        get_system_identity
+        local default_device_name="${SYSTEM_MODEL_SHORT}-${SYSTEM_SERIAL}"
         
         echo -ne "${BPurple}[INPUT REQUIRED]${Color_Off} Enter a name for this device in Remote.it (or press Enter for default: ${default_device_name}): "
         read -r device_name
@@ -1748,33 +1793,64 @@ register_with_remoteit() {
     
     if curl -L -o "$installer_file" https://downloads.remote.it/remoteit/install_agent.sh; then
         chmod +x "$installer_file"
+        print_info "Running Remote.it installer for device: ${device_name}..."
+        if sudo "$installer_file" -r "$registration_code" -n "$device_name"; then
+            print_success "Remote.it registration successful."
+            REMOTEIT_DEVICE_NAME_ACTUAL="${device_name}"
+            
+            sleep 5 # Give service time to start
+            if sudo systemctl --quiet is-active 'remoteit@*.service'; then
+                print_success "Remote.it service is active and operational."
+            else
+                print_warning "Installation ran, but service is not active yet."
+            fi
+            return 0
+        else
+            local exit_code=$?
+            print_error "Failed to install/register device with Remote.it (exit code: $exit_code)."
+            
+            print_action "Troubleshooting steps:"
+            print_action "- Verify your registration code is correct and has not expired"
+            print_action "- Check network connectivity"
+            print_action "- View logs: ${BYellow}sudo journalctl -u 'remoteit@*.service' -n 50 --no-pager${Color_Off}"
+            return 1
+        fi
     else
         print_error "Failed to download Remote.it installer."
         return 1
     fi
+}
+
+# --- New Function: NX Witness Setup ---
+run_nx_setup() {
+    print_info "Starting NX Witness configuration via nx_setup.py..."
     
-    # Run the installer
-    print_info "Running Remote.it installer..."
-    if sudo R3_REGISTRATION_CODE="$registration_code" R3_DEVICE_NAME="$device_name" "$installer_file"; then
-        print_success "Successfully ran Remote.it installer!"
-        
-        sleep 5 # Give service time to start
-        if sudo systemctl --quiet is-active 'remoteit@*.service'; then
-            print_success "Remote.it service is active and operational."
-        else
-            print_error "Installation ran, but service failed to start. Check logs."
-            print_action "View logs: ${BYellow}sudo journalctl -u 'remoteit@*.service' -n 50 --no-pager${Color_Off}"
+    # Ensure NX Setup helper is available (download if missing)
+    ensure_nx_setup_helper || return 1
+
+    # Ensure requests is installed (required by nx_setup.py)
+    if ! python3 -c "import requests" &>/dev/null; then
+        print_info "python3-requests not found. Installing..."
+        if ! sudo apt update || ! sudo apt install -y python3-requests; then
+            print_error "Failed to install python3-requests. NX setup cannot continue."
             return 1
         fi
+    fi
+
+    # Export hardware identity so the python script can use it for default naming
+    get_system_identity
+    export NX_DEFAULT_NAME="${SYSTEM_MODEL_SHORT}-${SYSTEM_SERIAL}"
+    export NX_SYSTEM_NAME="${NX_SYSTEM_NAME}"
+    export NX_ADMIN_PASS="${NX_ADMIN_PASS}"
+    export NX_CLOUD_USER="${NX_CLOUD_USER}"
+    export NX_CLOUD_PASS="${NX_CLOUD_PASS}"
+
+    print_info "Executing: python3 ${NX_SETUP_HELPER}"
+    if python3 "${NX_SETUP_HELPER}"; then
+        print_success "NX Witness setup completed successfully."
         return 0
     else
-        local exit_code=$?
-        print_error "Failed to install/register device with Remote.it (exit code: $exit_code)."
-        
-        print_action "Troubleshooting steps:"
-        print_action "- Verify your registration code is correct and has not expired"
-        print_action "- Check network connectivity"
-        print_action "- View logs: ${BYellow}sudo journalctl -u 'remoteit@*.service' -n 50 --no-pager${Color_Off}"
+        print_error "NX Witness setup failed. Check the logs above."
         return 1
     fi
 }
