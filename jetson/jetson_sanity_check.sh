@@ -115,8 +115,6 @@ PYTHON_HELPER_URL="${PYTHON_HELPER_URL:-https://raw.githubusercontent.com/HenryP
 PYTHON_HELPER="${SCRIPT_DIR}/jetson_jtop_helper.py"
 
 # NX Setup Configuration
-NX_SETUP_URL="${NX_SETUP_URL:-https://raw.githubusercontent.com/HenryPDT/jetson-scripts/main/jetson/nx_setup.py}"
-NX_SETUP_HELPER="${SCRIPT_DIR}/nx_setup.py"
 JTOP_DATA=""
 JTOP_INSTALLED=0
 # PENDING_POWER_MODE_ID and NAME are used for interactive changes
@@ -145,29 +143,6 @@ ensure_python_helper() {
         return 0
     else
         print_warning "Failed to download Python helper. Some jtop features will be unavailable."
-        return 1
-    fi
-}
-
-# --- Ensure NX Setup Helper is Available ---
-ensure_nx_setup_helper() {
-    # If the file exists locally and we ARE in a local script directory (not a temp one), use it
-    if [[ -f "${SCRIPT_DIR}/nx_setup.py" ]] && [[ ! "$NX_SETUP_HELPER" =~ /tmp/ ]]; then
-        return 0
-    fi
-    
-    # Otherwise, download the latest version to a temp file
-    print_info "Downloading NX setup helper from GitHub..."
-    local temp_nx
-    temp_nx=$(mktemp --suffix=.py)
-    TEMP_FILES+=("$temp_nx")
-    
-    if curl -sL "$NX_SETUP_URL" -o "$temp_nx" && [[ -s "$temp_nx" ]]; then
-        NX_SETUP_HELPER="$temp_nx"
-        print_success "NX setup helper downloaded successfully."
-        return 0
-    else
-        print_error "Failed to download NX setup helper. Automatic configuration will fail."
         return 1
     fi
 }
@@ -1821,38 +1796,300 @@ register_with_remoteit() {
     fi
 }
 
-# --- New Function: NX Witness Setup ---
+# --- Function: NX Witness Setup (Native Bash Integration) ---
 run_nx_setup() {
-    print_info "Starting NX Witness configuration via nx_setup.py..."
-    
-    # Ensure NX Setup helper is available (download if missing)
-    ensure_nx_setup_helper || return 1
+    print_info "Starting NX Witness configuration..."
 
-    # Ensure requests is installed (required by nx_setup.py)
-    if ! python3 -c "import requests" &>/dev/null; then
-        print_info "python3-requests not found. Installing..."
-        if ! sudo apt update || ! sudo apt install -y python3-requests; then
-            print_error "Failed to install python3-requests. NX setup cannot continue."
+    # Validations
+    local missing_vars=()
+    [ -z "${NX_ADMIN_PASS:-}" ] && missing_vars+=("NX_ADMIN_PASS")
+    [ -z "${NX_CLOUD_USER:-}" ] && missing_vars+=("NX_CLOUD_USER")
+    [ -z "${NX_CLOUD_PASS:-}" ] && missing_vars+=("NX_CLOUD_PASS")
+
+    if [ ${#missing_vars[@]} -gt 0 ]; then
+        print_error "Missing required environment variables: ${missing_vars[*]}"
+        print_info "These must be set via environment variables or the .secrets file."
+        return 1
+    fi
+
+    get_system_identity
+    local default_name="${SYSTEM_MODEL_SHORT}-${SYSTEM_SERIAL}"
+    local system_name="${NX_SYSTEM_NAME:-}"
+    local cloud_url="${NX_CLOUD_URL:-https://nxvms.com}"
+
+    # Step 1: Detect Server Port & State
+    print_info "Checking Server Status (Waiting for ports to open)..."
+    local active_port=""
+    local is_cloud_connected=0
+    local server_module_info=""
+
+    for attempt in {1..5}; do
+        for port in 7001 7011; do
+            local test_url="https://localhost:${port}/api/moduleInformation"
+            local resp
+            if resp=$(curl -s -k --max-time 3 "$test_url" 2>/dev/null); then
+                if echo "$resp" | jq -e '.reply' >/dev/null 2>&1; then
+                    active_port=$port
+                    server_module_info=$(echo "$resp" | jq -c '.reply')
+                    local cloud_id=$(echo "$server_module_info" | jq -r '.cloudSystemId // empty')
+                    if [ -n "$cloud_id" ]; then
+                        is_cloud_connected=1
+                    fi
+                    break 2
+                fi
+            fi
+        done
+        print_info "  Attempt $attempt/5: Server not ready yet. Retrying in 2s..."
+        sleep 2
+    done
+
+    if [ -z "$active_port" ]; then
+        print_error "Could not connect to Nx Server on 7001 or 7011 after 10 seconds."
+        print_info "Please ensure the service is running and not stuck in a crash loop."
+        return 1
+    fi
+
+    local server_url="https://localhost:${active_port}"
+    print_success "Server found active on port: ${active_port}"
+
+    # Step 2: Check Local Auth State
+    local needs_local_setup=0
+    local local_token=""
+
+    local check_auth
+    check_auth=$(curl -s -k -X POST "${server_url}/rest/v2/login/sessions" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\":\"admin\",\"password\":\"${NX_ADMIN_PASS}\"}")
+
+    local_token=$(echo "$check_auth" | jq -r '.token // empty')
+
+    if [ -n "$local_token" ] && [ "$local_token" != "null" ]; then
+        print_success "Local system is already initialized with the correct password."
+    else
+        local factory_auth
+        factory_auth=$(curl -s -k -X POST "${server_url}/rest/v2/login/sessions" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"admin\",\"password\":\"admin\"}")
+        local_token=$(echo "$factory_auth" | jq -r '.token // empty')
+
+        if [ -n "$local_token" ] && [ "$local_token" != "null" ]; then
+            print_warning "System is at factory defaults. Local setup is required."
+            needs_local_setup=1
+        else
+            print_error "Cannot log in with factory default OR the desired new password."
+            print_info "The system may have been initialized with an unknown password. Aborting."
             return 1
         fi
     fi
 
-    # Export hardware identity so the python script can use it for default naming
-    get_system_identity
-    export NX_DEFAULT_NAME="${SYSTEM_MODEL_SHORT}-${SYSTEM_SERIAL}"
-    export NX_SYSTEM_NAME="${NX_SYSTEM_NAME}"
-    export NX_ADMIN_PASS="${NX_ADMIN_PASS}"
-    export NX_CLOUD_USER="${NX_CLOUD_USER}"
-    export NX_CLOUD_PASS="${NX_CLOUD_PASS}"
+    # Step 3: Local Setup (if needed)
+    if [ $needs_local_setup -eq 1 ]; then
+        if [ -z "$system_name" ]; then
+            echo -ne "${BPurple}[INPUT REQUIRED]${Color_Off} Enter a name for this NX Witness System (or press Enter for default: ${default_name}): "
+            read -r system_name
+            [ -z "$system_name" ] && system_name="$default_name"
+        fi
 
-    print_info "Executing: python3 ${NX_SETUP_HELPER}"
-    if python3 "${NX_SETUP_HELPER}"; then
-        print_success "NX Witness setup completed successfully."
-        return 0
+        print_info "Initializing local system as '${system_name}'..."
+
+        # Safely construct JSON using jq
+        local setup_payload
+        setup_payload=$(jq -n \
+            --arg name "$system_name" \
+            --arg pass "$NX_ADMIN_PASS" \
+            '{name: $name, settingsPreset: "recommended", settings: {autoDiscoveryEnabled: false, cameraSettingsOptimization: false, statisticsAllowed: false}, local: {password: $pass}}')
+
+        local setup_resp_file
+        setup_resp_file=$(mktemp)
+        TEMP_FILES+=("$setup_resp_file")
+
+        local http_code
+        http_code=$(curl -s -k -w "%{http_code}" -o "$setup_resp_file" -X POST "${server_url}/rest/v2/system/setup" \
+            -H "Authorization: Bearer $local_token" \
+            -H "Content-Type: application/json" \
+            -d "$setup_payload")
+
+        if [ "$http_code" = "200" ]; then
+            print_success "Local system fully initialized as '${system_name}'."
+            sleep 2
+
+            # Re-authenticate to get a fresh token with the new password
+            local re_login
+            re_login=$(curl -s -k -X POST "${server_url}/rest/v2/login/sessions" \
+                -H "Content-Type: application/json" \
+                -d "{\"username\":\"admin\",\"password\":\"${NX_ADMIN_PASS}\"}")
+            local_token=$(echo "$re_login" | jq -r '.token // empty')
+
+            print_info "Renaming server node to '${system_name}'..."
+            local patch_resp_file
+            patch_resp_file=$(mktemp)
+            TEMP_FILES+=("$patch_resp_file")
+
+            local patch_code
+            patch_code=$(curl -s -k -w "%{http_code}" -o "$patch_resp_file" -X PATCH "${server_url}/rest/v2/servers/this" \
+                -H "Authorization: Bearer $local_token" \
+                -H "Content-Type: application/json" \
+                -d "{\"name\": \"${system_name}\"}")
+
+            if [ "$patch_code" = "200" ]; then
+                print_success "Server node renamed successfully."
+            else
+                print_warning "Failed to rename server node. HTTP: $patch_code"
+            fi
+        else
+            print_error "FAILED to initialize local system. HTTP: $http_code"
+            cat "$setup_resp_file"
+            echo ""
+            return 1
+        fi
     else
-        print_error "NX Witness setup failed. Check the logs above."
-        return 1
+        print_info "Local setup skipped (already complete)."
     fi
+
+    # Step 3.5: Refresh Server State
+    sleep 1
+    local mod_resp
+    mod_resp=$(curl -s -k "${server_url}/api/moduleInformation")
+    if echo "$mod_resp" | jq -e '.reply' >/dev/null 2>&1; then
+        server_module_info=$(echo "$mod_resp" | jq -c '.reply')
+    fi
+
+    # Step 4: Cloud Binding
+    if [ "$is_cloud_connected" -eq 0 ]; then
+        print_info "Authenticating with Nx Cloud..."
+
+        local cloud_oauth_payload
+        cloud_oauth_payload=$(jq -n \
+            --arg user "$NX_CLOUD_USER" \
+            --arg pass "$NX_CLOUD_PASS" \
+            --arg scope "${cloud_url} cloudSystemId=*" \
+            '{grant_type: "password", response_type: "token", client_id: "3rdParty", scope: $scope, username: $user, password: $pass}')
+
+        local cloud_oauth_req
+        cloud_oauth_req=$(curl -s -X POST "${cloud_url}/cdb/oauth2/token" \
+            -H "Content-Type: application/json" \
+            -d "$cloud_oauth_payload")
+
+        local cloud_access_token
+        cloud_access_token=$(echo "$cloud_oauth_req" | jq -r '.access_token // empty')
+
+        if [ -z "$cloud_access_token" ]; then
+            print_error "FAILED to authenticate with cloud. Check credentials."
+            return 1
+        fi
+
+        print_info "Binding system to Cloud..."
+        local current_sys_name
+        current_sys_name=$(echo "$server_module_info" | jq -r '.systemName // empty')
+        [ -z "$current_sys_name" ] && current_sys_name="${system_name:-$default_name}"
+
+        local cloud_bind_req
+        cloud_bind_req=$(curl -s -X POST "${cloud_url}/cdb/system/bind" \
+            -H "Authorization: Bearer $cloud_access_token" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"${current_sys_name}\",\"customization\":\"default\"}")
+
+        local cloud_sys_id
+        cloud_sys_id=$(echo "$cloud_bind_req" | jq -r '.id // empty')
+
+        if [ -n "$cloud_sys_id" ] && [ "$cloud_sys_id" != "null" ]; then
+            local auth_key=$(echo "$cloud_bind_req" | jq -r '.authKey // empty')
+            local owner_email=$(echo "$cloud_bind_req" | jq -r '.ownerAccountEmail // empty')
+            print_success "Cloud reservation successful. Cloud System ID: $cloud_sys_id"
+
+            print_info "Finalizing link to local server..."
+            local final_link_payload
+            final_link_payload=$(jq -n \
+                --arg id "$cloud_sys_id" \
+                --arg key "$auth_key" \
+                --arg email "$owner_email" \
+                '{systemId: $id, authKey: $key, owner: $email}')
+
+            local link_resp_file
+            link_resp_file=$(mktemp)
+            TEMP_FILES+=("$link_resp_file")
+
+            local fl_code
+            fl_code=$(curl -s -k -w "%{http_code}" -o "$link_resp_file" -X POST "${server_url}/rest/v2/system/cloudBind" \
+                -H "Authorization: Bearer $local_token" \
+                -H "Content-Type: application/json" \
+                -d "$final_link_payload")
+
+            if [ "$fl_code" = "200" ]; then
+                print_success "The local server is now connected to Nx Cloud."
+                is_cloud_connected=1
+                # Inject cloud ID for the audit print below
+                server_module_info=$(echo "$server_module_info" | jq -c ".cloudSystemId = \"$cloud_sys_id\"")
+            else
+                print_error "FAILED to link local server to cloud. HTTP: $fl_code"
+                cat "$link_resp_file"
+                echo ""
+            fi
+        else
+            print_error "FAILED to reserve system in the cloud."
+            echo "$cloud_bind_req"
+            return 1
+        fi
+    else
+        print_info "Cloud setup skipped (already complete)."
+    fi
+
+    # Step 5: Deep System Audit
+    echo -e "\n${BPurple}============================================================${Color_Off}"
+    echo -e "${BPurple}             NX SYSTEM AUDIT REPORT${Color_Off}"
+    echo -e "${BPurple}============================================================${Color_Off}"
+
+    local srv_resp
+    srv_resp=$(curl -s -k "${server_url}/rest/v2/servers/this" -H "Authorization: Bearer $local_token")
+    local local_server_id=$(echo "$srv_resp" | jq -r '.id // "Unknown"')
+    local srv_name=$(echo "$srv_resp" | jq -r '.name // "Unknown"')
+
+    local sys_name=$(echo "$server_module_info" | jq -r '.systemName // "Unknown"')
+    local loc_sys_id=$(echo "$server_module_info" | jq -r '.localSystemId // "Unknown"')
+    local cld_sys_id=$(echo "$server_module_info" | jq -r '.cloudSystemId // "Not Connected"')
+    [ "$cld_sys_id" = "null" ] && cld_sys_id="Not Connected"
+    local nx_ver=$(echo "$server_module_info" | jq -r '.version // "Unknown"')
+
+    echo -e "${BBlue}[ SERVER INFO ]${Color_Off}"
+    echo " System Name:      $sys_name"
+    echo " Server Node Name: $srv_name"
+    echo " Local System ID:  $loc_sys_id"
+    echo " Cloud System ID:  $cld_sys_id"
+    echo " Server Node ID:   $local_server_id"
+    echo " Nx Version:       $nx_ver"
+    echo " Hardware IP/Port: localhost:${active_port}"
+
+    echo -e "\n${BBlue}[ CAMERAS ON THIS SERVER NODE ]${Color_Off}"
+    if [ "$local_server_id" != "Unknown" ]; then
+        local cam_resp
+        cam_resp=$(curl -s -k -G "${server_url}/rest/v2/devices" \
+            -H "Authorization: Bearer $local_token" \
+            --data-urlencode "serverId=${local_server_id}")
+
+        local cam_count=$(echo "$cam_resp" | jq 'length')
+        if [ -n "$cam_count" ] && [ "$cam_count" -gt 0 ] && [ "$cam_count" != "null" ]; then
+            print_info "Total Cameras Found: $cam_count\n"
+
+            echo "$cam_resp" | jq -c '.[]' | while read -r cam; do
+                local c_name=$(echo "$cam" | jq -r '.name // "Unknown Camera"')
+                local c_id=$(echo "$cam" | jq -r '.id // "Unknown ID"' | tr -d '{}')
+                local c_status=$(echo "$cam" | jq -r '.status // "Unknown"' | tr '[:lower:]' '[:upper:]')
+                local c_ip=$(echo "$cam" | jq -r '.url // "Unknown IP"')
+
+                echo " - $c_name"
+                echo "    Status: $c_status | IP: $c_ip"
+                echo "    ID: $c_id"
+                echo "    ----------------------------------------"
+            done
+        else
+            print_info "No cameras found connected directly to this server node."
+        fi
+    else
+        print_warning "Could not determine the local Server ID to filter cameras."
+    fi
+
+    echo -e "${BPurple}============================================================${Color_Off}\n"
+    return 0
 }
 
 
