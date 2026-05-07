@@ -142,7 +142,7 @@ def get_jetson_info(enable_clocks=False, set_nvpmodel=None, set_fan_profile=None
                         # Fallback for JetPack 5+
                         fan_profile = getattr(fan, 'governor', getattr(fan, 'control', 'Unknown'))
                 except Exception as e:
-                    pass
+                    data['fan_read_error'] = str(e)
 
                 data['fan'] = {
                     'speed': fan_speed,
@@ -189,4 +189,4 @@ if __name__ == "__main__":
         set_nvpmodel=args.set_nvpmodel,
         set_fan_profile=args.set_fan_profile
     )
-    print(json.dumps(result, indent=2))
+    print(json.dumps(result))

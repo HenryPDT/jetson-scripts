@@ -32,9 +32,12 @@ show_usage() {
     echo ""
     echo "Requirements:"
     echo "  - Sudo access"
-    echo "  - .secrets file in the same directory containing:"
+    echo "  - Required secrets via environment variables or .secrets file:"
     echo "      CONDUCIVE_GIT_PAT, DOCKER_USER, DOCKER_PASS, REMOTEIT_REGISTRATION_CODE,"
     echo "      NX_ADMIN_PASS, NX_CLOUD_USER, NX_CLOUD_PASS"
+    echo ""
+    echo "Example (curl | bash):"
+    echo "  CONDUCIVE_GIT_PAT=\"...\" DOCKER_USER=\"...\" ... bash -c \"\\\$(curl -sL URL)\""
     exit 0
 }
 
@@ -122,6 +125,7 @@ PENDING_POWER_MODE_ID="-1"
 PENDING_POWER_MODE_NAME=""
 # Docker availability flag - set by check_docker_installed
 DOCKER_AVAILABLE=0
+APT_UPDATED=0
 
 # --- Ensure Python Helper is Available ---
 # If running via curl|bash, the helper will be downloaded automatically to ensure latest version
@@ -214,8 +218,8 @@ preflight_checks() {
         print_success "Internet connectivity verified."
     fi
     # 3. Essential Tools
-    print_info "Ensuring essential tools (nano) are installed..."
-    install_required_tools nano
+    print_info "Ensuring essential tools are installed..."
+    install_required_tools nano jq curl
 
     if [ $errors -gt 0 ]; then
         print_error "Preflight checks failed. Please ensure you have sudo privileges."
@@ -277,10 +281,13 @@ install_required_tools() {
     # Try to install missing tools
     print_info "Installing missing tools: ${missing_tools[*]}"
     
-    # Update package list first
-    if ! sudo apt update; then
-        print_error "Failed to update package list."
-        return 1
+    # Update package list first (cached to avoid redundant calls)
+    if [ "$APT_UPDATED" -eq 0 ]; then
+        if ! sudo apt update; then
+            print_error "Failed to update package list."
+            return 1
+        fi
+        APT_UPDATED=1
     fi
     
     # Install missing tools
@@ -641,28 +648,29 @@ ensure_jetson_stats_on_host() {
     return 0
 }
 
+# Helper: Run a command with jtop group privileges if the group exists
+run_with_jtop_group() {
+    local cmd="$1"
+    if getent group jtop >/dev/null 2>&1; then
+        sg jtop -c "$cmd" 2>/dev/null
+    else
+        eval "$cmd" 2>/dev/null
+    fi
+}
+
 check_jtop() {
   print_info "Checking JTOP (jetson-stats) and dependencies..."
-  
-  # 1. Ensure jq is installed
-  if ! command -v jq &> /dev/null; then
-    print_info "jq not found. Installing..."
-    if ! install_required_tools jq; then
-      print_error "Failed to install jq. JSON parsing will fail."
-      return 1
-    fi
-  fi
 
-  # 2. Ensure jetson-stats is installed and up-to-date
+  # 1. Ensure jetson-stats is installed and up-to-date
   ensure_jetson_stats_on_host || return 1
 
-  # 3. Ensure jtop service is running
+  # 2. Ensure jtop service is running
   if ! manage_jtop_service "start"; then
     print_error "jtop service failed to start properly. API calls may fail."
     return 1
   fi
 
-  # 4. Ensure user is in jtop group and handle permission check
+  # 3. Ensure user is in jtop group and handle permission check
   # Note: we check 'groups' (current session) instead of 'id -nG $USER' (system database)
   if ! groups | grep -qw "jtop"; then
       # The current session doesn't have the group. Check if it exists in the system.
@@ -677,15 +685,15 @@ check_jtop() {
       fi
   fi
 
-  # 5. Ensure Python helper is available (download if missing)
+  # 4. Ensure Python helper is available (download if missing)
   ensure_python_helper
 
   # 5. Fetch data using Python helper
   if [[ -f "$PYTHON_HELPER" ]]; then
     print_info "Fetching system data from jtop API..."
-    # Execute with jtop group privileges
+    # Execute with jtop group privileges if available
     local jtop_result
-    jtop_result=$(sg jtop -c "python3 \"$PYTHON_HELPER\"" 2>/dev/null)
+    jtop_result=$(run_with_jtop_group "python3 \"$PYTHON_HELPER\"")
     local jtop_exit=$?
     if [[ $jtop_exit -eq 0 ]] && [[ -n "$jtop_result" ]] && ! echo "$jtop_result" | jq -e '.error' &>/dev/null; then
       JTOP_DATA="$jtop_result"
@@ -719,7 +727,7 @@ check_fan_profile() {
         print_info "Attempting to set fan profile to 'cool'..."
         
         local action_result
-        action_result=$(sg jtop -c "python3 \"$PYTHON_HELPER\" --set-fan-profile cool" 2>/dev/null)
+        action_result=$(run_with_jtop_group "python3 \"$PYTHON_HELPER\" --set-fan-profile cool")
         local fan_exit=$?
         
         if [ $fan_exit -eq 0 ]; then
@@ -800,7 +808,7 @@ check_resource_stats() {
 
   # Temperatures
   echo -ne "${BBlue}[INFO]${Color_Off} Temperatures: "
-  echo "$JTOP_DATA" | jq -r '.temperature | to_entries | .[] | "\(.key): \(.value)°C"' | tr '\n' ' ' | sed 's/ $//'
+  echo "$JTOP_DATA" | jq -r '.temperature | to_entries | .[] | "\(.key): \(.value)°C"' | tr '\n' ' ' | sed 's/ $//' || true
   echo ""
 
   return 0
@@ -830,7 +838,7 @@ check_engines() {
         local status=$(echo "$group_data" | jq -r ".\"$group\".online | if . then \"ON\" else \"OFF\" end")
         echo "$status"
     else
-        echo "$group_data" | jq -r 'to_entries | .[] | "\(.key): \(.value.online | if . then "ON" else "OFF" end)"' | tr '\n' ' ' | sed 's/ $//'
+        echo "$group_data" | jq -r 'to_entries | .[] | "\(.key): \(.value.online | if . then "ON" else "OFF" end)"' | tr '\n' ' ' | sed 's/ $//' || true
         echo ""
     fi
   done
@@ -885,7 +893,7 @@ check_jetson_clocks() {
   
   # Call helper with --enable-clocks using jtop group
   local action_result
-  action_result=$(sg jtop -c "python3 \"$PYTHON_HELPER\" --enable-clocks" 2>/dev/null)
+  action_result=$(run_with_jtop_group "python3 \"$PYTHON_HELPER\" --enable-clocks")
   local clocks_exit=$?
   if [ $clocks_exit -eq 0 ]; then
      local action_msg=$(echo "$action_result" | jq -r '.clocks_action // "Unknown action"')
@@ -1305,13 +1313,16 @@ check_nx_witness() {
 
         # Proceed to check for installer
         print_info "Checking for NX Witness installer..."
-        if [ -f "$NX_INSTALLER_DEB" ]; then
-            print_info "Installer found: ${NX_INSTALLER_DEB}"
+        local installer_path="${SCRIPT_DIR}/${NX_INSTALLER_DEB}"
+        if [ -f "$installer_path" ]; then
+            print_info "Installer found: ${installer_path}"
         else
             print_warning "Installer ${NX_INSTALLER_DEB} not found locally."
-            print_action "Attempting to download the installer..."
+            print_info "Attempting to download the installer..."
+            installer_path=$(mktemp --suffix=.deb)
+            TEMP_FILES+=("$installer_path")
             if command -v wget &> /dev/null; then
-                wget --quiet --show-progress "$NX_INSTALLER_URL"
+                wget --quiet --show-progress -O "$installer_path" "$NX_INSTALLER_URL"
                 if [ $? -eq 0 ]; then
                     print_success "Successfully downloaded ${NX_INSTALLER_DEB}."
                 else
@@ -1327,10 +1338,10 @@ check_nx_witness() {
             fi
         fi
 
-        if [ -f "$NX_INSTALLER_DEB" ]; then
+        if [ -f "$installer_path" ]; then
              # Auto-install the NX Witness package
              print_info "Installing NX Witness package..."
-             if sudo apt install -y "./${NX_INSTALLER_DEB}"; then
+             if sudo apt install -y "$installer_path"; then
                  print_success "NX Witness installed successfully."
                  # Try to start the service
                  if sudo systemctl start "$NX_SERVICE_NAME"; then
@@ -1857,7 +1868,7 @@ run_nx_setup() {
     local local_token=""
 
     local check_auth
-    check_auth=$(curl -s -k -X POST "${server_url}/rest/v2/login/sessions" \
+    check_auth=$(curl -s -k --connect-timeout 5 --max-time 15 -X POST "${server_url}/rest/v2/login/sessions" \
         -H "Content-Type: application/json" \
         -d "{\"username\":\"admin\",\"password\":\"${NX_ADMIN_PASS}\"}")
 
@@ -1867,7 +1878,7 @@ run_nx_setup() {
         print_success "Local system is already initialized with the correct password."
     else
         local factory_auth
-        factory_auth=$(curl -s -k -X POST "${server_url}/rest/v2/login/sessions" \
+        factory_auth=$(curl -s -k --connect-timeout 5 --max-time 15 -X POST "${server_url}/rest/v2/login/sessions" \
             -H "Content-Type: application/json" \
             -d "{\"username\":\"admin\",\"password\":\"admin\"}")
         local_token=$(echo "$factory_auth" | jq -r '.token // empty')
@@ -1904,7 +1915,7 @@ run_nx_setup() {
         TEMP_FILES+=("$setup_resp_file")
 
         local http_code
-        http_code=$(curl -s -k -w "%{http_code}" -o "$setup_resp_file" -X POST "${server_url}/rest/v2/system/setup" \
+        http_code=$(curl -s -k --connect-timeout 5 --max-time 15 -w "%{http_code}" -o "$setup_resp_file" -X POST "${server_url}/rest/v2/system/setup" \
             -H "Authorization: Bearer $local_token" \
             -H "Content-Type: application/json" \
             -d "$setup_payload")
@@ -1915,7 +1926,7 @@ run_nx_setup() {
 
             # Re-authenticate to get a fresh token with the new password
             local re_login
-            re_login=$(curl -s -k -X POST "${server_url}/rest/v2/login/sessions" \
+            re_login=$(curl -s -k --connect-timeout 5 --max-time 15 -X POST "${server_url}/rest/v2/login/sessions" \
                 -H "Content-Type: application/json" \
                 -d "{\"username\":\"admin\",\"password\":\"${NX_ADMIN_PASS}\"}")
             local_token=$(echo "$re_login" | jq -r '.token // empty')
@@ -1926,7 +1937,7 @@ run_nx_setup() {
             TEMP_FILES+=("$patch_resp_file")
 
             local patch_code
-            patch_code=$(curl -s -k -w "%{http_code}" -o "$patch_resp_file" -X PATCH "${server_url}/rest/v2/servers/this" \
+            patch_code=$(curl -s -k --connect-timeout 5 --max-time 15 -w "%{http_code}" -o "$patch_resp_file" -X PATCH "${server_url}/rest/v2/servers/this" \
                 -H "Authorization: Bearer $local_token" \
                 -H "Content-Type: application/json" \
                 -d "{\"name\": \"${system_name}\"}")
@@ -1949,7 +1960,7 @@ run_nx_setup() {
     # Step 3.5: Refresh Server State
     sleep 1
     local mod_resp
-    mod_resp=$(curl -s -k "${server_url}/api/moduleInformation")
+    mod_resp=$(curl -s -k --connect-timeout 5 --max-time 15 "${server_url}/api/moduleInformation")
     if echo "$mod_resp" | jq -e '.reply' >/dev/null 2>&1; then
         server_module_info=$(echo "$mod_resp" | jq -c '.reply')
     fi
@@ -1966,7 +1977,7 @@ run_nx_setup() {
             '{grant_type: "password", response_type: "token", client_id: "3rdParty", scope: $scope, username: $user, password: $pass}')
 
         local cloud_oauth_req
-        cloud_oauth_req=$(curl -s -X POST "${cloud_url}/cdb/oauth2/token" \
+        cloud_oauth_req=$(curl -s --connect-timeout 10 --max-time 30 -X POST "${cloud_url}/cdb/oauth2/token" \
             -H "Content-Type: application/json" \
             -d "$cloud_oauth_payload")
 
@@ -1984,7 +1995,7 @@ run_nx_setup() {
         [ -z "$current_sys_name" ] && current_sys_name="${system_name:-$default_name}"
 
         local cloud_bind_req
-        cloud_bind_req=$(curl -s -X POST "${cloud_url}/cdb/system/bind" \
+        cloud_bind_req=$(curl -s --connect-timeout 10 --max-time 30 -X POST "${cloud_url}/cdb/system/bind" \
             -H "Authorization: Bearer $cloud_access_token" \
             -H "Content-Type: application/json" \
             -d "{\"name\":\"${current_sys_name}\",\"customization\":\"default\"}")
@@ -2010,7 +2021,7 @@ run_nx_setup() {
             TEMP_FILES+=("$link_resp_file")
 
             local fl_code
-            fl_code=$(curl -s -k -w "%{http_code}" -o "$link_resp_file" -X POST "${server_url}/rest/v2/system/cloudBind" \
+            fl_code=$(curl -s -k --connect-timeout 5 --max-time 15 -w "%{http_code}" -o "$link_resp_file" -X POST "${server_url}/rest/v2/system/cloudBind" \
                 -H "Authorization: Bearer $local_token" \
                 -H "Content-Type: application/json" \
                 -d "$final_link_payload")
@@ -2040,7 +2051,7 @@ run_nx_setup() {
     echo -e "${BPurple}============================================================${Color_Off}"
 
     local srv_resp
-    srv_resp=$(curl -s -k "${server_url}/rest/v2/servers/this" -H "Authorization: Bearer $local_token")
+    srv_resp=$(curl -s -k --connect-timeout 5 --max-time 15 "${server_url}/rest/v2/servers/this" -H "Authorization: Bearer $local_token")
     local local_server_id=$(echo "$srv_resp" | jq -r '.id // "Unknown"')
     local srv_name=$(echo "$srv_resp" | jq -r '.name // "Unknown"')
 
@@ -2062,7 +2073,7 @@ run_nx_setup() {
     echo -e "\n${BBlue}[ CAMERAS ON THIS SERVER NODE ]${Color_Off}"
     if [ "$local_server_id" != "Unknown" ]; then
         local cam_resp
-        cam_resp=$(curl -s -k -G "${server_url}/rest/v2/devices" \
+        cam_resp=$(curl -s -k --connect-timeout 5 --max-time 15 -G "${server_url}/rest/v2/devices" \
             -H "Authorization: Bearer $local_token" \
             --data-urlencode "serverId=${local_server_id}")
 
