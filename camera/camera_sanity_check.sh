@@ -803,13 +803,30 @@ run_sadp_discovery() {
         print_info "Scanning network using SADP (socat)..."
         
         # Check if we are on a router with br-lan to ensure we scan the correct interface
-        local socat_opts="broadcast,sp=37020"
+        local socat_opts_base="broadcast,sp=37020"
+        local socat_opts="$socat_opts_base"
         if [ -d "/sys/class/net/br-lan" ]; then
             socat_opts="${socat_opts},so-bindtodevice=br-lan"
             print_info "Routing issue detected: Binding discovery to 'br-lan' interface."
         fi
 
-        scan_res=$(echo "$probe" | timeout 3 socat -t 3 - UDP-DATAGRAM:239.255.255.250:37020,${socat_opts} 2>/dev/null)
+        local stderr_log="/tmp/socat_err.log"
+        scan_res=$(echo "$probe" | socat -T 5 -t 5 - UDP-DATAGRAM:239.255.255.250:37020,${socat_opts} 2>"$stderr_log")
+
+        # Fallback if so-bindtodevice is unsupported on this socat build (e.g. OpenWrt minimal builds)
+        if [ -z "$scan_res" ] && grep -qiE "unknown option|not found|unrecognized" "$stderr_log" && [ "$socat_opts" != "$socat_opts_base" ]; then
+            print_warning "Interface binding unsupported by this socat. Retrying without binding..."
+            scan_res=$(echo "$probe" | socat -T 5 -t 5 - UDP-DATAGRAM:239.255.255.250:37020,${socat_opts_base} 2>"$stderr_log")
+        fi
+
+        # If we failed to get a response and a command threw an error, output it for debugging
+        if [ -z "$scan_res" ] && [ -s "$stderr_log" ]; then
+            local err_msg
+            err_msg=$(head -n 2 "$stderr_log" | tr '\n' ' ' | sed 's/ *$//')
+            if [ -n "$err_msg" ]; then
+                print_info "SADP Debug: $err_msg"
+            fi
+        fi
     else
         print_warning "SADP Discovery requires 'socat'. Skipping network scan."
         return 1
@@ -840,7 +857,7 @@ run_sadp_discovery() {
 
 # --- CLEANUP TRAP ---
 cleanup() {
-    rm -f /tmp/hik_*.xml /tmp/sadp_results.txt
+    rm -f /tmp/hik_*.xml /tmp/sadp_results.txt /tmp/socat_err.log
 }
 trap cleanup EXIT
 
