@@ -1420,6 +1420,12 @@ check_conducive_analytics() {
             ;;
         1)
             print_success "Found ConduciveAnalytics repository at: ${found_paths[0]}"
+            print_info "Updating git remote URL to ensure authentication token is current..."
+            if git -C "${found_paths[0]}" remote set-url origin "$CONDUCIVE_REPO_URL" 2>/dev/null; then
+                print_success "Git remote URL updated successfully."
+            else
+                print_warning "Failed to update git remote URL. You may need to manually update it."
+            fi
             return 0
             ;;
         *)
