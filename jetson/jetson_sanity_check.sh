@@ -160,23 +160,23 @@ BBlue='\033[1;34m'        # Blue
 BPurple='\033[1;35m'      # Purple
 
 print_info() {
-  echo -e "${BBlue}[INFO]${Color_Off} $1"
+  printf "${BBlue}[INFO]${Color_Off} %b\n" "$1"
 }
 
 print_success() {
-  echo -e "${BGreen}[SUCCESS]${Color_Off} $1"
+  printf "${BGreen}[SUCCESS]${Color_Off} %b\n" "$1"
 }
 
 print_warning() {
-  echo -e "${BYellow}[WARNING]${Color_Off} $1"
+  printf "${BYellow}[WARNING]${Color_Off} %b\n" "$1"
 }
 
 print_error() {
-  echo -e "${BRed}[ERROR]${Color_Off} $1"
+  printf "${BRed}[ERROR]${Color_Off} %b\n" "$1"
 }
 
 print_action() {
-  echo -e "${BPurple}[ACTION REQUIRED]${Color_Off} $1"
+  printf "${BPurple}[ACTION REQUIRED]${Color_Off} %b\n" "$1"
 }
 
 # --- Result Tracking ---
@@ -230,7 +230,7 @@ preflight_checks() {
 print_summary() {
     echo ""
     echo "========================================"
-    echo -e "${BBlue}      SANITY CHECK SUMMARY${Color_Off}"
+    printf "${BBlue}      SANITY CHECK SUMMARY${Color_Off}\n"
     echo "========================================"
     
     for i in "${!CHECK_NAMES[@]}"; do
@@ -248,9 +248,9 @@ print_summary() {
     done
     
     echo "----------------------------------------"
-    echo -e "Total Checks: ${#CHECK_NAMES[@]}"
-    echo -e "${BGreen}Passed:       $SUCCESS_COUNT${Color_Off}"
-    echo -e "${BRed}Failed/Warn:  $FAILURE_COUNT${Color_Off}"
+    printf "Total Checks: %d\n" "${#CHECK_NAMES[@]}"
+    printf "${BGreen}Passed:       %d${Color_Off}\n" "$SUCCESS_COUNT"
+    printf "${BRed}Failed/Warn:  %d${Color_Off}\n" "$FAILURE_COUNT"
     echo "========================================"
     
     if [ $FAILURE_COUNT -gt 0 ]; then
@@ -807,7 +807,7 @@ check_resource_stats() {
   print_info "Fan: ${fan_speed}% (Profile: ${fan_profile})"
 
   # Temperatures
-  echo -ne "${BBlue}[INFO]${Color_Off} Temperatures: "
+  printf "${BBlue}[INFO]${Color_Off} Temperatures: "
   echo "$JTOP_DATA" | jq -r '.temperature | to_entries | .[] | "\(.key): \(.value)°C"' | tr '\n' ' ' | sed 's/ $//' || true
   echo ""
 
@@ -831,7 +831,7 @@ check_engines() {
   local groups=$(echo "$engines" | jq -r 'keys | .[]')
   for group in $groups; do
     local group_data=$(echo "$engines" | jq -r ".\"$group\"")
-    echo -ne "  ${BPurple}${group}:${Color_Off} "
+    printf "  ${BPurple}%s:${Color_Off} " "$group"
     
     local keys=($(echo "$group_data" | jq -r 'keys | .[]'))
     if [ "${#keys[@]}" -eq 1 ] && [ "${keys[0]}" == "$group" ]; then
@@ -1013,7 +1013,7 @@ setup_nvme_ssd() {
             local size_gb=$(awk -v s="$size_bytes" 'BEGIN { printf "%.1f", s / (1024*1024*1024) }')
             echo "  [$i] /dev/${name} (${size_gb} GB)"
         done
-        echo -ne "${BPurple}[INPUT REQUIRED]${Color_Off} Select device number [0-$((${#nvme_devices[@]}-1))]: "
+        printf "${BPurple}[INPUT REQUIRED]${Color_Off} Select device number [0-%d]: " "$((${#nvme_devices[@]}-1))"
         read -r selection
         if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -lt ${#nvme_devices[@]} ]; then
             target_device=$(echo "${nvme_devices[$selection]}" | cut -d: -f1)
@@ -1060,7 +1060,7 @@ setup_nvme_ssd() {
     # --- STAGE 5: Final confirmation ---
     echo ""
     echo "========================================"
-    echo -e "${BRed}    ⚠️  DESTRUCTIVE OPERATION WARNING ⚠️${Color_Off}"
+    printf "${BRed}    ⚠️  DESTRUCTIVE OPERATION WARNING ⚠️${Color_Off}\n"
     echo "========================================"
     echo ""
     echo "You are about to COMPLETELY WIPE the following device:"
@@ -1076,9 +1076,9 @@ setup_nvme_ssd() {
     echo "  3. Format with ${NVME_FILESYSTEM} filesystem"
     echo "  4. Mount at ${NVME_MOUNT_POINT}"
     echo ""
-    echo -e "${BRed}ALL DATA ON THIS DEVICE WILL BE PERMANENTLY LOST!${Color_Off}"
+    printf "${BRed}ALL DATA ON THIS DEVICE WILL BE PERMANENTLY LOST!${Color_Off}\n"
     echo ""
-    echo -ne "${BPurple}[CONFIRMATION REQUIRED]${Color_Off} Type ${BYellow}YES${Color_Off} (uppercase) to proceed: "
+    printf "${BPurple}[CONFIRMATION REQUIRED]${Color_Off} Type ${BYellow}YES${Color_Off} (uppercase) to proceed: "
     read -r confirmation
     
     if [ "$confirmation" != "YES" ]; then
@@ -1430,7 +1430,7 @@ check_conducive_analytics() {
             ;;
         *)
             print_warning "Found multiple directories named '${CONDUCIVE_REPO_NAME}':"
-            for path in "${found_paths[@]}"; do echo -e "  - ${path}"; done
+            for path in "${found_paths[@]}"; do printf "  - %b\n" "${path}"; done
             print_action "Verify correct repository and clean up duplicates."
             return 1
             ;;
@@ -1764,7 +1764,7 @@ register_with_remoteit() {
         get_system_identity
         local default_device_name="${SYSTEM_MODEL_SHORT}-${SYSTEM_SERIAL}"
         
-        echo -ne "${BPurple}[INPUT REQUIRED]${Color_Off} Enter a name for this device in Remote.it (or press Enter for default: ${default_device_name}): "
+        printf "${BPurple}[INPUT REQUIRED]${Color_Off} Enter a name for this device in Remote.it (or press Enter for default: %s): " "${default_device_name}"
         read -r device_name
         if [ -z "$device_name" ]; then
             device_name="${default_device_name}"
@@ -1902,7 +1902,7 @@ run_nx_setup() {
     # Step 3: Local Setup (if needed)
     if [ $needs_local_setup -eq 1 ]; then
         if [ -z "$system_name" ]; then
-            echo -ne "${BPurple}[INPUT REQUIRED]${Color_Off} Enter a name for this NX Witness System (or press Enter for default: ${default_name}): "
+            printf "${BPurple}[INPUT REQUIRED]${Color_Off} Enter a name for this NX Witness System (or press Enter for default: %s): " "${default_name}"
             read -r system_name
             [ -z "$system_name" ] && system_name="$default_name"
         fi
@@ -2052,9 +2052,9 @@ run_nx_setup() {
     fi
 
     # Step 5: Deep System Audit
-    echo -e "\n${BPurple}============================================================${Color_Off}"
-    echo -e "${BPurple}             NX SYSTEM AUDIT REPORT${Color_Off}"
-    echo -e "${BPurple}============================================================${Color_Off}"
+    printf "\n${BPurple}============================================================${Color_Off}\n"
+    printf "${BPurple}             NX SYSTEM AUDIT REPORT${Color_Off}\n"
+    printf "${BPurple}============================================================${Color_Off}\n"
 
     local srv_resp
     srv_resp=$(curl -s -k --connect-timeout 5 --max-time 15 "${server_url}/rest/v2/servers/this" -H "Authorization: Bearer $local_token")
@@ -2067,7 +2067,7 @@ run_nx_setup() {
     [ "$cld_sys_id" = "null" ] && cld_sys_id="Not Connected"
     local nx_ver=$(echo "$server_module_info" | jq -r '.version // "Unknown"')
 
-    echo -e "${BBlue}[ SERVER INFO ]${Color_Off}"
+    printf "${BBlue}[ SERVER INFO ]${Color_Off}\n"
     echo " System Name:      $sys_name"
     echo " Server Node Name: $srv_name"
     echo " Local System ID:  $loc_sys_id"
@@ -2076,7 +2076,7 @@ run_nx_setup() {
     echo " Nx Version:       $nx_ver"
     echo " Hardware IP/Port: localhost:${active_port}"
 
-    echo -e "\n${BBlue}[ CAMERAS ON THIS SERVER NODE ]${Color_Off}"
+    printf "\n${BBlue}[ CAMERAS ON THIS SERVER NODE ]${Color_Off}\n"
     if [ "$local_server_id" != "Unknown" ]; then
         local cam_resp
         cam_resp=$(curl -s -k --connect-timeout 5 --max-time 15 -G "${server_url}/rest/v2/devices" \
@@ -2105,7 +2105,7 @@ run_nx_setup() {
         print_warning "Could not determine the local Server ID to filter cameras."
     fi
 
-    echo -e "${BPurple}============================================================${Color_Off}\n"
+    printf "${BPurple}============================================================${Color_Off}\n\n"
     return 0
 }
 
