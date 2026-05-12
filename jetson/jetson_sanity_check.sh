@@ -116,6 +116,10 @@ REMOTEIT_DEVICE_NAME=""  # Will prompt user if empty
 # JTOP Helper Configuration
 PYTHON_HELPER_URL="${PYTHON_HELPER_URL:-https://raw.githubusercontent.com/HenryPDT/jetson-scripts/main/jetson/jetson_jtop_helper.py}"
 PYTHON_HELPER="${SCRIPT_DIR}/jetson_jtop_helper.py"
+JTOP_PYTHON="python3" # Default fallback
+if [[ -x "$HOME/.local/share/jtop/bin/python" ]]; then
+    JTOP_PYTHON="$HOME/.local/share/jtop/bin/python"
+fi
 
 # NX Setup Configuration
 JTOP_DATA=""
@@ -522,19 +526,15 @@ manage_jtop_service() {
     local action="${1:-restart}"
     local service_name=""
 
-    # Detect service name first
-    if sudo systemctl cat jetson_stats.service &>/dev/null; then
-        service_name="jetson_stats.service"
-    elif sudo systemctl cat jtop.service &>/dev/null; then
+    # Only use jtop.service (modern standard)
+    if sudo systemctl cat jtop.service &>/dev/null; then
         service_name="jtop.service"
     fi
-    
+
     # If not found, try daemon-reload and check again
     if [ -z "$service_name" ]; then
         sudo systemctl daemon-reload >/dev/null 2>&1
-        if sudo systemctl cat jetson_stats.service &>/dev/null; then
-            service_name="jetson_stats.service"
-        elif sudo systemctl cat jtop.service &>/dev/null; then
+        if sudo systemctl cat jtop.service &>/dev/null; then
             service_name="jtop.service"
         fi
     fi
@@ -584,68 +584,118 @@ manage_jtop_service() {
 }
 
 
-# Ensure jetson-stats is installed and up-to-date on the host
-# Version parity between host service and container client is required.
+# Ensure jetson-stats is installed and up-to-date on the host.
+# Prioritizes the Option 2 (sudo pip3) method from the user's fork.
+# Falls back to the Option 4 uv-venv method (install_jtop_torun_without_sudo.sh /
+# upgrade-jtop.sh) if pip3 fails or is restricted.
+# This ensures compatibility across ALL JetPack versions, including old
+# JetPack 4.x devices that only have Python 3.6 system-wide.
 ensure_jetson_stats_on_host() {
     if [ "$IS_JETSON" -eq 1 ]; then
         local FORK_URL="git+https://github.com/HenryPDT/jetson_stats.git"
         local MIN_VERSION="7.1.5"
-        
+        # Base raw URL for the install/upgrade scripts in the HenryPDT fork
+        local SCRIPTS_BASE="https://raw.githubusercontent.com/HenryPDT/jetson_stats/master/scripts"
+
         print_info "Checking jetson-stats on host (Target Version: $MIN_VERSION)..."
 
         if ! command -v jtop &> /dev/null; then
-            print_info "jtop not found. Installing from $FORK_URL..."
-            if ! command -v pip3 &> /dev/null; then
-                if ! install_required_tools python3-pip; then
-                    print_error "Failed to install pip3."
-                    return 1
+            # ── Fresh install ────────────────────────────────────────────────
+            print_info "jtop not found. Attempting install via pip3 (Option 2)..."
+            
+            local pip_success=0
+            # Try Option 2 (sudo pip3) first as requested by user
+            local pip_cmd="sudo -H pip3 install --upgrade \"$FORK_URL\""
+            # Handle PEP 668 on newer systems
+            if python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" 2>/dev/null; then
+                pip_cmd="sudo -H pip3 install --upgrade --break-system-packages \"$FORK_URL\""
+            fi
+
+            if eval "$pip_cmd"; then
+                # Verify that it actually installed the binary and it's runnable
+                if command -v jtop &>/dev/null && jtop -v &>/dev/null; then
+                    print_success "jetson-stats installed via pip3."
+                    # For pip3 installs, we usually need to manually install the service
+                    print_info "Ensuring jtop service is installed..."
+                    sudo jtop --install-service >/dev/null 2>&1 || true
+                    pip_success=1
+                else
+                    print_warning "pip3 reported success but jtop command is missing or broken (possibly incompatible Python version)."
                 fi
             fi
-            # Try standard install first, fall back to --break-system-packages for newer Ubuntu
-            if sudo pip3 install "$FORK_URL" 2>/dev/null || sudo pip3 install --break-system-packages "$FORK_URL"; then
-                print_success "jetson-stats installed successfully."
-                # Explicitly install the service and set up the jtop group
-                print_info "Configuring jtop service and permissions..."
-                if ! sudo jtop --install-service; then
-                    print_warning "jtop --install-service returned an error, but proceeding..."
+
+            if [ "$pip_success" -eq 0 ]; then
+                print_warning "Falling back to uv-venv method (Option 4)..."
+                if JTOP_REF="$FORK_URL" bash -c \
+                    "$(curl -LsSf ${SCRIPTS_BASE}/install_jtop_torun_without_sudo.sh)"; then
+                    print_success "jetson-stats installed successfully via uv-venv."
+                    pip_success=1
                 fi
-                # Source the new environment variables for the current script session
+            fi
+
+            if [ "$pip_success" -eq 1 ]; then
+                # Source the env script for the current session if present (Option 4 uses this)
                 if [ -f /etc/profile.d/jtop_env.sh ]; then
+                    # shellcheck source=/dev/null
                     source /etc/profile.d/jtop_env.sh
                 fi
                 manage_jtop_service "restart"
                 JTOP_INSTALLED=1
-                # Ensure user is in the jtop group
+                # Ensure user is in the jtop group (group is created by the install scripts)
                 if getent group jtop > /dev/null; then
                     sudo usermod -aG jtop "$USER"
                 fi
+                return 0
             else
-                print_error "Failed to install jetson-stats."
+                print_error "All jtop installation methods failed."
                 return 1
             fi
-            return 0
         fi
 
-        # Check installed version
-        local current_ver=$(jtop -v | head -n 1 | awk '{print $NF}')
+        # ── Version check ────────────────────────────────────────────────────
+        local current_ver
+        current_ver=$(jtop -v 2>/dev/null | head -n 1 | awk '{print $NF}')
         print_info "Detected jtop version: $current_ver"
 
-        # Simple version comparison (assumes semver-ish format)
+        # Simple version comparison (semver-ish)
         if [ "$(printf '%s\n%s' "$MIN_VERSION" "$current_ver" | sort -V | head -n1)" != "$MIN_VERSION" ]; then
             print_info "Host jtop version ($current_ver) is older than recommended ($MIN_VERSION)."
-            print_info "Updating from $FORK_URL..."
-            if sudo pip3 install --upgrade "$FORK_URL" 2>/dev/null || sudo pip3 install --upgrade --break-system-packages "$FORK_URL"; then
-                print_success "jetson-stats updated successfully."
-                # Ensure service is re-installed and reloaded after update
-                sudo jtop --install-service
+            print_info "Attempting upgrade via pip3 (Option 2)..."
+            
+            local upgrade_success=0
+            local pip_cmd="sudo -H pip3 install --upgrade \"$FORK_URL\""
+            if python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" 2>/dev/null; then
+                pip_cmd="sudo -H pip3 install --upgrade --break-system-packages \"$FORK_URL\""
+            fi
+
+            if eval "$pip_cmd"; then
+                # Verify upgrade success
+                if jtop -v &>/dev/null; then
+                    print_success "jetson-stats upgraded via pip3."
+                    upgrade_success=1
+                else
+                    print_warning "pip3 upgrade reported success but jtop is broken."
+                fi
+            fi
+
+            if [ "$upgrade_success" -eq 0 ]; then
+                print_warning "Falling back to uv-venv upgrade (Option 4)..."
+                if JTOP_REF="$FORK_URL" bash -c \
+                    "$(curl -LsSf ${SCRIPTS_BASE}/upgrade-jtop.sh)"; then
+                    print_success "jetson-stats upgraded successfully via uv-venv."
+                    upgrade_success=1
+                fi
+            fi
+
+            if [ "$upgrade_success" -eq 1 ]; then
                 manage_jtop_service "restart"
                 JTOP_INSTALLED=1
             else
-                print_error "Failed to update jetson-stats."
+                print_error "All jtop upgrade methods failed."
                 return 1
             fi
         else
-            print_success "Host jtop version is correct."
+            print_success "Host jtop version ($current_ver) meets minimum ($MIN_VERSION)."
         fi
     fi
     return 0
@@ -693,10 +743,15 @@ check_jtop() {
 
   # 5. Fetch data using Python helper
   if [[ -f "$PYTHON_HELPER" ]]; then
+    # Detect the correct Python interpreter again in case it was just installed
+    if [[ -x "$HOME/.local/share/jtop/bin/python" ]]; then
+        JTOP_PYTHON="$HOME/.local/share/jtop/bin/python"
+    fi
+
     print_info "Fetching system data from jtop API..."
     # Execute with jtop group privileges if available
     local jtop_result
-    jtop_result=$(run_with_jtop_group "python3 \"$PYTHON_HELPER\"")
+    jtop_result=$(run_with_jtop_group "$JTOP_PYTHON \"$PYTHON_HELPER\"")
     local jtop_exit=$?
     if [[ $jtop_exit -eq 0 ]] && [[ -n "$jtop_result" ]] && ! echo "$jtop_result" | jq -e '.error' &>/dev/null; then
       JTOP_DATA="$jtop_result"
@@ -737,7 +792,7 @@ check_fan_profile() {
         print_info "Attempting to set fan profile to 'cool'..."
         
         local action_result
-        action_result=$(run_with_jtop_group "python3 \"$PYTHON_HELPER\" --set-fan-profile cool")
+        action_result=$(run_with_jtop_group "$JTOP_PYTHON \"$PYTHON_HELPER\" --set-fan-profile cool")
         local fan_exit=$?
         
         if [ $fan_exit -eq 0 ]; then
@@ -903,7 +958,7 @@ check_jetson_clocks() {
   
   # Call helper with --enable-clocks using jtop group
   local action_result
-  action_result=$(run_with_jtop_group "python3 \"$PYTHON_HELPER\" --enable-clocks")
+  action_result=$(run_with_jtop_group "$JTOP_PYTHON \"$PYTHON_HELPER\" --enable-clocks")
   local clocks_exit=$?
   if [ $clocks_exit -eq 0 ]; then
      local action_msg=$(echo "$action_result" | jq -r '.clocks_action // "Unknown action"')

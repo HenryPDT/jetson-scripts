@@ -130,6 +130,7 @@ def get_jetson_info(enable_clocks=False, set_nvpmodel=None, set_fan_profile=None
                 fan = jetson.fan
                 fan_speed = 0
                 fan_profile = "Unknown"
+                fan_profiles = []
 
                 try:
                     # Get speed (handle list or scalar)
@@ -141,12 +142,18 @@ def get_jetson_info(enable_clocks=False, set_nvpmodel=None, set_fan_profile=None
                     if not fan_profile or fan_profile == "Unknown":
                         # Fallback for JetPack 5+
                         fan_profile = getattr(fan, 'governor', getattr(fan, 'control', 'Unknown'))
+                    
+                    # Get available profiles
+                    fan_profiles = getattr(fan, 'profiles', getattr(fan, 'available_profiles', []))
+                    if isinstance(fan_profiles, dict):
+                        fan_profiles = list(fan_profiles.keys())
                 except Exception as e:
                     data['fan_read_error'] = str(e)
 
                 data['fan'] = {
                     'speed': fan_speed,
-                    'profile': fan_profile
+                    'profile': fan_profile,
+                    'profiles': fan_profiles
                 }
 
                 # GPU Processes
