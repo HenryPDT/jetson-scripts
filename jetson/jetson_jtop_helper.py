@@ -65,9 +65,9 @@ def get_jetson_info(enable_clocks=False, set_nvpmodel=None, set_fan_profile=None
 
                 # NVP Model (Power Mode)
                 data['nvpmodel'] = {
-                    'name': jetson.nvpmodel.name if jetson.nvpmodel else "Unknown",
-                    'id': jetson.nvpmodel.id if jetson.nvpmodel else -1,
-                    'models': jetson.nvpmodel.models if jetson.nvpmodel else []
+                    'name': getattr(jetson.nvpmodel, 'name', "Unknown") if jetson.nvpmodel else "Unknown",
+                    'id': getattr(jetson.nvpmodel, 'id', -1) if jetson.nvpmodel else -1,
+                    'models': getattr(jetson.nvpmodel, 'models', []) if jetson.nvpmodel else []
                 }
 
                 # Jetson Clocks

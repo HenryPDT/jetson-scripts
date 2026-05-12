@@ -365,8 +365,8 @@ check_system_time() {
         return 1
     fi
     
-    local ntp_active=$(echo "$td_status" | grep "NTP service:" | grep -c "active" || echo 0)
-    local synced=$(echo "$td_status" | grep "System clock synchronized:" | grep -c "yes" || echo 0)
+    local ntp_active=$(echo "$td_status" | grep -E "NTP service:|Network time on:|systemd-timesyncd.service active:" | grep -Ei "active|yes" | wc -l)
+    local synced=$(echo "$td_status" | grep -E "System clock synchronized:|NTP synchronized:" | grep -Ei "yes" | wc -l)
     
     # --- PROACTIVE FIX: NTP SERVICE ---
     if [ "$ntp_active" -eq 0 ]; then
@@ -376,29 +376,29 @@ check_system_time() {
             sleep 2
             # Refresh status for the display block below
             td_status=$(timedatectl status 2>/dev/null)
-            ntp_active=$(echo "$td_status" | grep "NTP service:" | grep -c "active" || echo 0)
-            synced=$(echo "$td_status" | grep "System clock synchronized:" | grep -c "yes" || echo 0)
+            ntp_active=$(echo "$td_status" | grep -E "NTP service:|Network time on:|systemd-timesyncd.service active:" | grep -Ei "active|yes" | wc -l)
+            synced=$(echo "$td_status" | grep -E "System clock synchronized:|NTP synchronized:" | grep -Ei "yes" | wc -l)
         else
             print_error "Failed to enable NTP service automatically."
         fi
     fi
 
     # Display the essential parts of the status
-    echo "$td_status" | grep -E "Local time:|Universal time:|RTC time:|Time zone:|System clock synchronized:|NTP service:" | while read -r line; do
+    echo "$td_status" | grep -E "Local time:|Universal time:|RTC time:|Time zone:|System clock synchronized:|NTP synchronized:|NTP service:|Network time on:|systemd-timesyncd.service active:" | while read -r line; do
         print_info "  $(echo "$line" | sed 's/^[ \t]*//')"
     done
 
     local errors=0
     
     # 2. Status reporting
-    if [ "$ntp_active" -eq 1 ]; then
+    if [ "$ntp_active" -ge 1 ]; then
         print_success "NTP service is active."
     else
         print_warning "NTP service is NOT active. Time may drift."
         errors=$((errors + 1))
     fi
     
-    if [ "$synced" -eq 1 ]; then
+    if [ "$synced" -ge 1 ]; then
         print_success "System clock is synchronized."
     else
         print_error "System clock is NOT synchronized. Local time may be incorrect."
@@ -434,8 +434,11 @@ check_system_time() {
     fi
 
     # Return 0 if both active and synced, else return 1 to trigger warning/fail in summary
-    if [ "$ntp_active" -eq 1 ] && [ "$synced" -eq 1 ]; then
+    # Return 0 if both active and synced, 2 for warning (e.g. synced but NTP status delayed), else 1
+    if [ "$ntp_active" -ge 1 ] && [ "$synced" -ge 1 ]; then
         return 0
+    elif [ "$synced" -ge 1 ]; then
+        return 2 # Warning: Synchronized but NTP service status is uncertain
     else
         return 1
     fi
@@ -720,9 +723,16 @@ check_fan_profile() {
     fi
 
     local current_profile=$(echo "$JTOP_DATA" | jq -r '.fan.profile // "Unknown"')
-    print_info "Current Fan Profile: ${current_profile}"
+    local available_profiles=$(echo "$JTOP_DATA" | jq -r '.fan.profiles | join(", ") // "None"')
+    print_info "Current Fan Profile: ${current_profile} (Available: ${available_profiles})"
 
     if [ "$current_profile" != "cool" ]; then
+        # Check if 'cool' is even an option
+        if [[ ! "$available_profiles" =~ "cool" ]]; then
+            print_success "Fan profile is '${current_profile}'. Note: 'cool' profile is not available on this hardware."
+            return 0
+        fi
+
         print_warning "Fan profile is NOT set to 'cool'."
         print_info "Attempting to set fan profile to 'cool'..."
         
@@ -1031,6 +1041,13 @@ setup_nvme_ssd() {
     # Check if any partition is mounted
     local mounted_parts=$(lsblk -lno NAME,MOUNTPOINT "/dev/${target_device}" 2>/dev/null | awk '$2 != "" {print $1 " -> " $2}')
     if [ -n "$mounted_parts" ]; then
+        # CRITICAL SAFETY CHECK: Is it the root filesystem?
+        if echo "$mounted_parts" | grep -qE " -> /$| -> /boot"; then
+            print_success "Device /dev/${target_device} is already configured as the system root/boot device."
+            print_info "Skipping formatting/partitioning logic."
+            return 0
+        fi
+
         print_error "Device /dev/${target_device} has mounted partitions:"
         echo "$mounted_parts"
         print_error "Cannot proceed - device is in use. Unmount partitions first."
@@ -1234,6 +1251,8 @@ check_ssd() {
         print_info "Available space on ${target_mountpoint}: ${available_gb} GB."
         if [ "$available_gb" -lt "$MIN_SSD_FREE_GB" ]; then
             print_warning "Available space (${available_gb}GB) < minimum ${MIN_SSD_FREE_GB}GB."
+            # Return warning code (2) if this is the only issue
+            if [ "$errors" -eq 0 ]; then return 2; fi
             errors=$((errors + 1))
         else
             print_success "Sufficient free space available (${available_gb}GB >= ${MIN_SSD_FREE_GB}GB)."
@@ -1856,12 +1875,12 @@ run_nx_setup() {
                 fi
             fi
         done
-        print_info "  Attempt $attempt/5: Server not ready yet. Retrying in 2s..."
-        sleep 2
+        print_info "  Attempt $attempt/5: Server not ready yet. Retrying in 5s..."
+        sleep 5
     done
 
     if [ -z "$active_port" ]; then
-        print_error "Could not connect to Nx Server on 7001 or 7011 after 10 seconds."
+        print_error "Could not connect to Nx Server on 7001 or 7011 after 25 seconds."
         print_info "Please ensure the service is running and not stuck in a crash loop."
         return 1
     fi
